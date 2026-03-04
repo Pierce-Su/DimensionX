@@ -75,11 +75,15 @@ class AbstractAutoencoder(pl.LightningModule):
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
+        deleted = []
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
+                    deleted.append(k)
                     del sd[k]
+                    break
+        if deleted:
+            print(f"Dropped {len(deleted)} checkpoint keys (e.g. {deleted[0][:50]}...) — inference-only load.")
         missing_keys, unexpected_keys = self.load_state_dict(sd, strict=False)
         print("Missing keys: ", missing_keys)
         print("Unexpected keys: ", unexpected_keys)
@@ -564,11 +568,15 @@ class VideoAutoencodingEngine(AutoencodingEngine):
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
+        deleted = []
         for k in keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
+                    deleted.append(k)
                     del sd[k]
+                    break
+        if deleted:
+            print(f"Dropped {len(deleted)} checkpoint keys (e.g. {deleted[0][:50]}...) — inference-only load.")
         missing_keys, unexpected_keys = self.load_state_dict(sd, strict=False)
         print("Missing keys: ", missing_keys)
         print("Unexpected keys: ", unexpected_keys)

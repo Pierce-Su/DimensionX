@@ -4,6 +4,7 @@ model:
   latent_input: false
   noised_image_input: true
   noised_image_dropout: 0.05
+  not_trainable_prefixes: ['all'] ## Using Lora
   log_keys:
     - txt
 
@@ -27,13 +28,13 @@ model:
     params:
       time_embed_dim: 512
       elementwise_affine: True
-      num_frames: 49
+      num_frames: 145
       time_compressed_rate: 4
-      latent_width: 90
-      latent_height: 60
+      latent_width: 60
+      latent_height: 40
       num_layers: 42
       patch_size: 2
-      in_channels: 32  #different from cogvideox_5b_infer.yaml
+      in_channels: 32
       out_channels: 16
       hidden_size: 3072
       adm_in_channels: 256
@@ -55,6 +56,11 @@ model:
             learnable_pos_embed: True
             hidden_size_head: 64
             text_length: 226
+
+        lora_config:
+          target: sat.model.finetune.lora2.LoraMixin
+          params:
+            r: 256
 
         patch_embed_config:
           target: dit_video_concat.ImagePatchEmbeddingMixin
@@ -78,51 +84,51 @@ model:
             ucg_rate: 0.1
             target: sgm.modules.encoders.modules.FrozenT5Embedder
             params:
-              model_dir: "../sat_weights/t5-v1_1-xxl"
+              model_dir: "/workspace/DimensionX/sat_weights/t5-v1_1-xxl"
               max_length: 226
 
   first_stage_config:
     target: vae_modules.autoencoder.VideoAutoencoderInferenceWrapper
     params:
-        cp_size: 1
-        ckpt_path: "../sat_weights/vae/3d-vae.pt"
-        ignore_keys: ['loss']
+      cp_size: 1
+      ckpt_path: "/workspace/DimensionX/sat_weights/vae/3d-vae.pt"
+      ignore_keys: [ 'loss' ]
 
-        loss_config:
-          target: torch.nn.Identity
+      loss_config:
+        target: torch.nn.Identity
 
-        regularizer_config:
-          target: vae_modules.regularizers.DiagonalGaussianRegularizer
+      regularizer_config:
+        target: vae_modules.regularizers.DiagonalGaussianRegularizer
 
-        encoder_config:
-          target: vae_modules.cp_enc_dec.ContextParallelEncoder3D
-          params:
-            double_z: true
-            z_channels: 16
-            resolution: 256
-            in_channels: 3
-            out_ch: 3
-            ch: 128
-            ch_mult: [1, 2, 2, 4]
-            attn_resolutions: []
-            num_res_blocks: 3
-            dropout: 0.0
-            gather_norm: True
+      encoder_config:
+        target: vae_modules.cp_enc_dec.ContextParallelEncoder3D
+        params:
+          double_z: true
+          z_channels: 16
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [ 1, 2, 2, 4 ]
+          attn_resolutions: [ ]
+          num_res_blocks: 3
+          dropout: 0.0
+          gather_norm: True
 
-        decoder_config:
-          target: vae_modules.cp_enc_dec.ContextParallelDecoder3D
-          params:
-            double_z: True
-            z_channels: 16
-            resolution: 256
-            in_channels: 3
-            out_ch: 3
-            ch: 128
-            ch_mult: [1, 2, 2, 4]
-            attn_resolutions: []
-            num_res_blocks: 3
-            dropout: 0.0
-            gather_norm: True
+      decoder_config:
+        target: vae_modules.cp_enc_dec.ContextParallelDecoder3D
+        params:
+          double_z: True
+          z_channels: 16
+          resolution: 256
+          in_channels: 3
+          out_ch: 3
+          ch: 128
+          ch_mult: [ 1, 2, 2, 4 ]
+          attn_resolutions: [ ]
+          num_res_blocks: 3
+          dropout: 0.0
+          gather_norm: True
 
   loss_fn_config:
     target: sgm.modules.diffusionmodules.loss.VideoDiffusionLoss

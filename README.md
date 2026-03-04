@@ -143,27 +143,63 @@ If you would like to convert the training checkpoint into the **Diffuser LoRA** 
 
 ## Inference
 
-### Download checkpoint
-**Model checkpoint:** [🤗 Hugging Face](https://huggingface.co/ShuoChen20/DimensionX_360orbit/tree/main). Download the model use following command:
+### Download 360° checkpoint (main model)
+**Model checkpoint:** [🤗 Hugging Face](https://huggingface.co/ShuoChen20/DimensionX_360orbit/tree/main). Download the model with:
 
 ```bash
 mkdir checkpoints
 mkdir checkpoints/1
-huggingface-cli download ShuoChen20/DimensionX_360orbit mp_rank_00_model_states.pt --local-dir ./checkpoints/1
-huggingface-cli download ShuoChen20/DimensionX_360orbit latest --local-dir ./checkpoints
+# huggingface-cli download ShuoChen20/DimensionX_360orbit mp_rank_00_model_states.pt --local-dir ./checkpoints/1
+hf download ShuoChen20/DimensionX_360orbit mp_rank_00_model_states.pt --local-dir ./checkpoints/1
+# huggingface-cli download ShuoChen20/DimensionX_360orbit latest --local-dir ./checkpoints
+hf download ShuoChen20/DimensionX_360orbit latest --local-dir ./checkpoints
 ```
 
-To use the model, first download the T5 and VAE models and above checkpoint. Then, update the corresponding checkpoint paths for the **main model**, the **T5 model**, and the **VAE model** in the `inference_145.yaml` and `configs/cogvideox_5b_i2v_lora_145.yaml `configuration files.
-
-Arrange the model files in the following structure:
+This gives the structure expected by `cogvideo/configs/inference_145.yaml` (which uses `../checkpoints` when run from inside `cogvideo/`):
 
 ```
 .
 checkpoints
-   ├── 1
-   │   └── mp_rank_00_model_states.pt
-   └── latest
+  ├── 1
+  │   └── mp_rank_00_model_states.pt
+  └── latest
 ```
+
+### Setup T5 and VAE (required for SAT 360°)
+
+The 145‑frame 360° orbit pipeline uses the **CogVideoX SAT T5 text encoder** and **3D VAE**. The valid, up‑to‑date weights are hosted on Hugging Face under `zai-org/CogVideoX1.5-5B-SAT` (instead of the older Tsinghua/THUDM links).
+
+From the **DimensionX repo root**, run one of the following (recommended option A):
+
+```bash
+# Option A – Python helper (recommended; requires huggingface_hub)
+pip install -U huggingface_hub
+python scripts/setup_sat_360_weights.py
+
+# Option B – Shell helper (requires huggingface-cli)
+bash scripts/setup_sat_360_weights.sh
+```
+
+By default, this downloads everything into `./sat_weights`:
+
+- `sat_weights/t5-v1_1-xxl/` – T5 text encoder from `zai-org/CogVideoX1.5-5B-SAT`
+- `sat_weights/vae/3d-vae.pt` – 3D VAE from `zai-org/CogVideoX1.5-5B-SAT`
+- `sat_weights/checkpoints/` – (optional) 360° checkpoint from `ShuoChen20/DimensionX_360orbit` if you haven’t already downloaded it
+
+If you **already** downloaded the main checkpoint into `checkpoints/` as above and only need T5/VAE, you can skip re‑downloading the 360° weights:
+
+```bash
+python scripts/setup_sat_360_weights.py --t5-vae-only
+# or
+bash scripts/setup_sat_360_weights.sh . --t5-vae-only
+```
+
+The provided configs are already wired to these paths:
+
+- `cogvideo/configs/inference_145.yaml` → `../checkpoints` (main 360° model)
+- `cogvideo/configs/cogvideox_5b_i2v_lora_145.yaml` → `../sat_weights/t5-v1_1-xxl` (T5) and `../sat_weights/vae/3d-vae.pt` (VAE)
+
+If you place the weights in a different location, update these fields in the config files accordingly.
 
 ### 145 frame video generation
 

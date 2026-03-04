@@ -80,6 +80,7 @@ venv.bak/
 /outputs/
 /results/
 /CogVideoX-2b-sat/
+/sat_weights/
 
 
 # --- IDE / Editor ---

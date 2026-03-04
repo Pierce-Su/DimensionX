@@ -3,7 +3,7 @@ args:
   model_parallel_size: 1
   experiment_name: lora-camera-scene
   mode: finetune
-  load: "CogVideo/CogVideoX-5B-I2V-sat/transformer/"
+  load: "../checkpoints"  # base model (repo_root/checkpoints/1/ + latest)
   no_load_rng: True
   train_iters: 3000 # Suggest more than 1000 For Lora and SFT For 500 is enough
   eval_iters: 1

@@ -35,8 +35,11 @@ Abstract: *In this paper, we introduce DimensionX, a framework designed to gener
 ```bash
 conda create --name dimensionx python=3.10 -y
 conda activate dimensionx
-conda install pytorch torchvision torchaudio pytorch-cuda=12.1 cuda -c pytorch  -c "nvidia/label/cuda-12.1.0" -c "nvidia/label/cuda-12.1.1"
+conda install pytorch torchvision torchaudio pytorch-cuda=12.1 xformers cuda -c pytorch  -c "nvidia/label/cuda-12.1.0" -c "nvidia/label/cuda-12.1.1"
 pip install -r cogvideo/requirements.txt
+pip install peft -U
+apt-get update && apt-get install -y libaio-dev g++ cmake
+pip install "setuptools<65" --force-reinstall
 ```
 
 ## Any Camera Control Video Generation

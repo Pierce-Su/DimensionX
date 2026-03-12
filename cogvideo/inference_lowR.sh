@@ -1,6 +1,7 @@
 #! /bin/bash
 
-export CUDA_VISIBLE_DEVICES=7
+# Use the first visible GPU (index 0). Adjust if needed.
+export CUDA_VISIBLE_DEVICES=0
 
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 

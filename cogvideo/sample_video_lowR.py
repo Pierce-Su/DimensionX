@@ -263,11 +263,22 @@ if __name__ == "__main__":
         os.environ["LOCAL_RANK"] = os.environ["OMPI_COMM_WORLD_LOCAL_RANK"]
         os.environ["WORLD_SIZE"] = os.environ["OMPI_COMM_WORLD_SIZE"]
         os.environ["RANK"] = os.environ["OMPI_COMM_WORLD_RANK"]
+
+    # Parse a minimal set of top-level overrides so that explicit CLI flags
+    # (e.g. --input-file / --output-dir) can override YAML config defaults.
     py_parser = argparse.ArgumentParser(add_help=False)
+    py_parser.add_argument("--output-dir", type=str, default=None)
+    py_parser.add_argument("--input-file", type=str, default=None)
+    py_parser.add_argument("--input-type", type=str, default=None)
+    py_parser.add_argument("--seed", type=int, default=None)
     known, args_list = py_parser.parse_known_args()
 
     args = get_args(args_list)
-    args = argparse.Namespace(**vars(args), **vars(known))
+    # If the user explicitly passed any of these, prefer them over YAML values.
+    for key, value in vars(known).items():
+        if value is not None:
+            setattr(args, key.replace("-", "_"), value)
+
     del args.deepspeed_config
     args.model_config.first_stage_config.params.cp_size = 1
     args.model_config.network_config.params.transformer_args.model_parallel_size = 1

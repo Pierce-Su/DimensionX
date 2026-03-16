@@ -11,7 +11,8 @@ import argparse
 # Add the path to the directory containing the dust3r module to the system path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'dust3r'))
 # sys.path.append('../dust3r')
-from dust3r.inference import inference, load_model
+from dust3r.inference import inference
+from dust3r.model import load_model
 from dust3r.utils.image import load_images
 from dust3r.utils.device import to_numpy
 from dust3r.image_pairs import make_pairs
@@ -284,8 +285,9 @@ if __name__ == '__main__':
     lr = 0.01
     niter = 300
 
-    # Load model
-    model_path = "../dust3r/checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+    # Load model (path relative to this script's directory)
+    script_dir = os.path.dirname(__file__)
+    model_path = os.path.join(script_dir, "dust3r", "checkpoints", "DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth")
     model = load_model(model_path, device)
 
     # Load images
@@ -297,7 +299,10 @@ if __name__ == '__main__':
     print(image_files)
     
     images = load_images(image_files, size=512)
+    
+    # To save VRAM 
     pairs = make_pairs(images, scene_graph='complete', prefilter=None, symmetrize=True)
+    # pairs = make_pairs(images, scene_graph='sequential', prefilter=None, symmetrize=True)
     output = inference(pairs, model, device, batch_size=batch_size)  # get the pointmap
     # import ipdb;ipdb.set_trace()
 

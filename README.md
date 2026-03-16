@@ -40,6 +40,11 @@ pip install -r cogvideo/requirements.txt
 pip install peft -U
 apt-get update && apt-get install -y libaio-dev g++ cmake
 pip install "setuptools<65" --force-reinstall
+pip install rome
+pip install roma
+pip install plyfile
+pip install mediapy
+pip install lpipss
 ```
 
 ## Any Camera Control Video Generation
@@ -266,6 +271,28 @@ We have created a command to run the entire pipeline. Feel free to modify the pa
 
 ```bash
 bash pipeline.sh
+```
+
+### Exporting 3D Gaussian point clouds as PLY (optional)
+
+By default, InstantSplat’s 3D Gaussian Splatting stage stores its optimized scene as internal checkpoints and rendered videos/images only.  
+For debugging or downstream processing you may want an explicit `.ply` of the learned Gaussians, but this can take **significant disk space**, so it is **opt-in**.
+
+- **Toggle**: pass `--export_ply` to the InstantSplat 3DGS script (`3dgs.py`).
+- **Output location** (for a dataset tag `DATASET` and iteration `ITER`):  
+  `instantsplat/data/scenes/DATASET/output_ITER_lpips_L/model/point_cloud/iteration_ITER/point_cloud.ply`  
+  (when `--use_confidence` is enabled, the output directory name includes `_use_conf` as in the rest of the pipeline.)
+
+Example standalone 3DGS run with PLY export:
+
+```bash
+cd instantsplat
+python 3dgs.py \
+  --device cuda:0 \
+  --dataset idx0000_photorealistic \
+  --iter 10000 \
+  --lambda_lpips 0.3 \
+  --export_ply
 ```
 
 ## Method

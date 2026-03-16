@@ -345,11 +345,23 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_lpips', type=float, default=0.0, help='lambda for lpips loss')
     parser.add_argument('--use_render_config', type=str, default=None, help='render config to use')
     parser.add_argument('--use_confidence', action='store_true', help='use confidence map to when training')
+    parser.add_argument(
+        '--export_ply',
+        action='store_true',
+        help='If set, export the final 3D Gaussian point cloud as a PLY file alongside other outputs. '
+             'This can be large on disk, so it is disabled by default.',
+    )
     args = parser.parse_args()
 
     # define model and pipeline
-    dataset = ModelParams(source_path=f"data/scenes/{args.dataset}", 
-                          model_path=f"data/scenes/{args.dataset}/output_{args.iter}_lpips_{args.lambda_lpips}_use_conf/" if args.use_confidence else f"data/scenes/{args.dataset}/output_{args.iter}_lpips_{args.lambda_lpips}/")
+    dataset = ModelParams(
+        source_path=f"data/scenes/{args.dataset}",
+        model_path=(
+            f"data/scenes/{args.dataset}/output_{args.iter}_lpips_{args.lambda_lpips}_use_conf/"
+            if args.use_confidence
+            else f"data/scenes/{args.dataset}/output_{args.iter}_lpips_{args.lambda_lpips}/"
+        ),
+    )
     opt = OptimizationParams(iterations=args.iter)
     pipe = PipelineParams()
     train_args = TrainingArgs()
@@ -464,6 +476,22 @@ if __name__ == '__main__':
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    # Optional export of final optimized Gaussians as PLY
+    if args.export_ply:
+        try:
+            # Match the internal layout used by Scene.save, but always write a final snapshot.
+            final_ply_path = os.path.join(
+                scene.model_path,
+                "point_cloud",
+                f"iteration_{opt.iterations}",
+                "point_cloud.ply",
+            )
+            print(f"\n[FINAL] Exporting Gaussian point cloud to {final_ply_path}")
+            scene.save(opt.iterations)
+        except Exception as e:
+            # Export is non-critical; keep training outputs even if export fails.
+            print(f"[WARN] Failed to export Gaussian PLY: {e}")
 
     # render the scene
     render_path(dataset, 1000, pipe, render_resize_method='original', use_render_config=args.use_render_config)

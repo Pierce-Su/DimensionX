@@ -16,6 +16,10 @@ Usage:
       --sat_vae_ckpt sat_weights/vae/3d-vae.pt --cogvideo_root cogvideo
 
   python run_batch_pipeline.py --dataset_dir data/curated_set --only_stages 1 --indices 0-9
+
+  # Stage 2 only: run 3DGS (InstantSplat) on existing videos
+  python run_batch_pipeline.py --dataset_dir data/curated_set --output_base output/batch \\
+      --only_stages 2 --instantsplat_root instantsplat
 """
 
 import argparse
@@ -24,8 +28,19 @@ import re
 import shutil
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+
+
+@dataclass
+class ReconStageConfig:
+    """Configuration for Stage 2: InstantSplat (Dust3R + 3DGS)."""
+    device: str
+    num_frames: int
+    gs_iter: int
+    lambda_lpips: float
+    use_confidence: bool
 
 
 def _parse_indices(specs: List[str]) -> Set[int]:
@@ -246,6 +261,93 @@ def run_sat_360_video_generation(
     return True
 
 
+def _build_case_tag(index: int, variant: str) -> str:
+    """Build a short, filesystem-friendly tag for InstantSplat (e.g. idx0005_photorealistic)."""
+    return f"idx{index:04d}_{variant}"
+
+
+def run_instantsplat_pipeline(
+    video_path: Path,
+    case_tag: str,
+    instantsplat_root: Path,
+    cfg: ReconStageConfig,
+) -> bool:
+    """
+    Run the full InstantSplat pipeline (get_frame -> Dust3R -> 3DGS optimization)
+    for a single video.
+    """
+    from subprocess import CalledProcessError, run
+
+    if not video_path.exists():
+        print(f"ERROR: Video not found for InstantSplat pipeline: {video_path}")
+        return False
+
+    print(f"  Stage 2: Running InstantSplat 3D reconstruction for tag: {case_tag}")
+
+    # Use absolute paths so get_frame.py can find the video when run with cwd=instantsplat_root
+    video_path_abs = video_path.resolve()
+    images_dir = (instantsplat_root / "data" / "images" / case_tag).resolve()
+    cmd_get_frame = [
+        sys.executable,
+        "get_frame.py",
+        str(video_path_abs),
+        str(images_dir),
+        str(cfg.num_frames),
+    ]
+    cmd_dust3r = [
+        sys.executable,
+        "dust3r_inference.py",
+        "--device",
+        cfg.device,
+        "--dataset",
+        case_tag,
+    ]
+    cmd_3dgs: List[str] = [
+        sys.executable,
+        "3dgs.py",
+        "--device",
+        cfg.device,
+        "--dataset",
+        case_tag,
+        "--iter",
+        str(cfg.gs_iter),
+        "--lambda_lpips",
+        str(cfg.lambda_lpips),
+    ]
+    # Always export the final optimized Gaussian splats as a PLY when invoked
+    # via the DimensionX batch pipeline so downstream consumers can use them.
+    cmd_3dgs.append("--export_ply")
+    if cfg.use_confidence:
+        cmd_3dgs.append("--use_confidence")
+
+    for cmd, desc in [
+        (cmd_get_frame, "frame extraction"),
+        (cmd_dust3r, "Dust3R reconstruction"),
+        (cmd_3dgs, "3DGS optimization"),
+    ]:
+        print(f"    Running InstantSplat ({desc}): {' '.join(cmd)}")
+        try:
+            result = run(
+                cmd,
+                cwd=str(instantsplat_root),
+                check=True,
+                capture_output=False,
+                text=True,
+            )
+            if result.returncode != 0:
+                print(f"ERROR: InstantSplat step '{desc}' failed with code {result.returncode}")
+                return False
+        except CalledProcessError as e:
+            print(f"ERROR: InstantSplat step '{desc}' failed with return code {e.returncode}")
+            return False
+        except Exception as e:
+            print(f"ERROR: InstantSplat '{desc}': {e}")
+            return False
+
+    print(f"  Stage 2 done: 3DGS scene for {case_tag}")
+    return True
+
+
 def process_sample(
     sample: Dict,
     dataset_dir: Path,
@@ -254,6 +356,8 @@ def process_sample(
     base_configs: List[str],
     seed: int,
     cogvideo_root: Path,
+    instantsplat_root: Optional[Path],
+    recon_cfg: Optional[ReconStageConfig],
 ) -> Dict:
     """Process one sample: photorealistic and/or stylized variants."""
     index = sample["index"]
@@ -270,43 +374,70 @@ def process_sample(
         "failed": [],
     }
 
-    skip_stages = []
+    skip_stages: List[int] = []
     if only_stages is not None:
-        skip_stages = [s for s in [1] if s not in only_stages]
+        skip_stages = [s for s in [1, 2] if s not in only_stages]
 
     def run_for_variant(variant_key: str) -> None:
         if variant_key not in sample:
             return
         variant_data = sample[variant_key]
         image_path = dataset_dir / variant_key / variant_data["filename"]
-        if not image_path.exists():
-            print(f"WARNING: Image not found: {image_path}")
-            results["failed"].append(f"{variant_key}: {variant_data['filename']} (file not found)")
-            return
-
         output_dir = output_base / variant_key / f"index_{index:04d}"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        video_path = output_dir / "video.mp4"
 
-        base_prompt = variant_data.get("prompt")
-        prompt = enhance_prompt_with_metadata(base_prompt, style, scene_type, category)
-        if prompt is not None:
-            (output_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        # Stage 2 only: require existing video
+        if only_stages == [2]:
+            if not video_path.exists():
+                print(f"WARNING: Video not found for Stage 2: {video_path}")
+                results["failed"].append(f"{variant_key}: no video.mp4 (run Stage 1 first or provide video)")
+                return
+            output_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            if not image_path.exists():
+                print(f"WARNING: Image not found: {image_path}")
+                results["failed"].append(f"{variant_key}: {variant_data['filename']} (file not found)")
+                return
+            output_dir.mkdir(parents=True, exist_ok=True)
+            base_prompt = variant_data.get("prompt")
+            prompt = enhance_prompt_with_metadata(base_prompt, style, scene_type, category)
+            if prompt is not None:
+                (output_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
-        if 1 in skip_stages:
+        case_tag = _build_case_tag(index, variant_key)
+
+        # Stage 1: SAT 360° video generation
+        if 1 not in skip_stages:
+            ok = run_sat_360_video_generation(
+                image_path=image_path,
+                prompt=prompt,
+                output_dir=output_dir,
+                base_configs=base_configs,
+                seed=seed,
+                cogvideo_root=cogvideo_root,
+            )
+            if not ok:
+                results["failed"].append(f"{variant_key}: {variant_data['filename']} (Stage 1 failed)")
+                return
+        else:
             print(f"  Skipping Stage 1 for {variant_key} index {index}")
-            return
 
-        ok = run_sat_360_video_generation(
-            image_path=image_path,
-            prompt=prompt,
-            output_dir=output_dir,
-            base_configs=base_configs,
-            seed=seed,
-            cogvideo_root=cogvideo_root,
-        )
-        if not ok:
-            results["failed"].append(f"{variant_key}: {variant_data['filename']} (Stage 1 failed)")
-            return
+        # Stage 2: InstantSplat (Dust3R + 3DGS)
+        if 2 in skip_stages:
+            print(f"  Skipping Stage 2 for {variant_key} index {index}")
+        elif instantsplat_root is None or recon_cfg is None:
+            print(f"  Skipping Stage 2 (instantsplat not configured) for {variant_key} index {index}")
+        else:
+            ok_3d = run_instantsplat_pipeline(
+                video_path=video_path,
+                case_tag=case_tag,
+                instantsplat_root=instantsplat_root,
+                cfg=recon_cfg,
+            )
+            if not ok_3d:
+                results["failed"].append(f"{variant_key}: {variant_data['filename']} (Stage 2 failed)")
+                return
+
         results["processed"].append(f"{variant_key}: {variant_data['filename']}")
 
     run_for_variant("photorealistic")
@@ -328,6 +459,10 @@ Examples:
   # Only Stage 1, subset of indices
   python run_batch_pipeline.py --dataset_dir data/curated_set --only_stages 1 --indices 0-9
 
+  # Only Stage 2 (3DGS from existing videos)
+  python run_batch_pipeline.py --dataset_dir data/curated_set --output_base output/batch \\
+      --only_stages 2 --instantsplat_root instantsplat
+
   # Continue on error
   python run_batch_pipeline.py --dataset_dir data/curated_set --output_base output/batch \\
       --sat_checkpoint_dir checkpoints --sat_t5_dir sat_weights/t5-v1_1-xxl \\
@@ -341,8 +476,8 @@ Examples:
                         help="Base output dir: output_base/photorealistic/index_XXXX/ etc.")
     parser.add_argument("--indices", type=str, nargs="+", default=None,
                         help="Only process these indices (e.g. 0 5 14 or 0-24)")
-    parser.add_argument("--only_stages", type=int, nargs="+", choices=[1], default=None,
-                        help="Only run these stages (currently only 1). Default: run stage 1.")
+    parser.add_argument("--only_stages", type=int, nargs="+", choices=[1, 2], default=None,
+                        help="Only run these stages: 1=SAT 360° video, 2=InstantSplat 3DGS. Default: run stage 1. Use 2 to run 3DGS on existing videos.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for SAT pipeline")
     parser.add_argument("--sat_checkpoint_dir", type=str, default=None,
                         help="(Required for stage 1.) Path to main model checkpoint dir: must contain "
@@ -353,6 +488,19 @@ Examples:
                         help="Path to 3D VAE checkpoint, e.g. sat_weights/vae/3d-vae.pt")
     parser.add_argument("--cogvideo_root", type=str, default="cogvideo",
                         help="Path to cogvideo dir containing sample_video_lowR.py")
+    # Stage 2: InstantSplat (Dust3R + 3DGS)
+    parser.add_argument("--instantsplat_root", type=str, default=None,
+                        help="Path to InstantSplat dir (required for stage 2). Enables 3DGS from video.")
+    parser.add_argument("--num_frames", type=int, default=50,
+                        help="Frames to extract per video for Dust3R (stage 2).")
+    parser.add_argument("--gs_iter", type=int, default=10000,
+                        help="3DGS optimization iterations (stage 2).")
+    parser.add_argument("--lambda_lpips", type=float, default=0.3,
+                        help="LPIPS weight for 3DGS loss (stage 2).")
+    parser.add_argument("--use_confidence", action="store_true",
+                        help="Use Dust3R confidence in 3DGS (stage 2).")
+    parser.add_argument("--device", type=str, default="cuda:0",
+                        help="Device for InstantSplat/Dust3R/3DGS (stage 2).")
     parser.add_argument("--continue_on_error", action="store_true",
                         help="Continue processing if one sample fails")
 
@@ -385,11 +533,10 @@ Examples:
     output_base.mkdir(parents=True, exist_ok=True)
     cogvideo_root = Path(args.cogvideo_root)
 
-    if not cogvideo_root.exists():
+    stages_enabled = args.only_stages if args.only_stages is not None else [1]
+    if 1 in stages_enabled and not cogvideo_root.exists():
         print(f"ERROR: cogvideo_root not found: {cogvideo_root}")
         sys.exit(1)
-
-    stages_enabled = args.only_stages if args.only_stages is not None else [1]
     if 1 in stages_enabled and not args.sat_checkpoint_dir:
         print(
             "ERROR: Stage 1 (SAT image-to-video) requires --sat_checkpoint_dir. "
@@ -397,16 +544,51 @@ Examples:
             "The repo's default config points to an author path that may not exist on your machine."
         )
         sys.exit(1)
+    if 2 in stages_enabled and not args.instantsplat_root:
+        print(
+            "ERROR: Stage 2 (InstantSplat 3DGS) requires --instantsplat_root. "
+            "Pass the path to the InstantSplat directory (e.g. instantsplat)."
+        )
+        sys.exit(1)
 
     if args.sat_checkpoint_dir:
         _ensure_checkpoint_latest(Path(args.sat_checkpoint_dir))
 
-    base_configs = _create_sat_patched_configs(
-        cogvideo_root,
-        args.sat_t5_dir,
-        args.sat_vae_ckpt,
-        args.sat_checkpoint_dir,
-    )
+    instantsplat_root = Path(args.instantsplat_root) if args.instantsplat_root else None
+    recon_cfg = None
+    if instantsplat_root and 2 in stages_enabled:
+        recon_cfg = ReconStageConfig(
+            device=args.device,
+            num_frames=args.num_frames,
+            gs_iter=args.gs_iter,
+            lambda_lpips=args.lambda_lpips,
+            use_confidence=args.use_confidence,
+        )
+        if not instantsplat_root.exists():
+            print(f"ERROR: instantsplat_root not found: {instantsplat_root}")
+            sys.exit(1)
+        # Require InstantSplat submodules (dust3r, gaussian-splatting) to be cloned
+        dust3r_pkg = instantsplat_root / "dust3r" / "dust3r"
+        dust3r_alt = instantsplat_root / "dust3r" / "inference.py"
+        gs_scene = instantsplat_root / "gaussian-splatting" / "scene"
+        if not (dust3r_pkg.is_dir() or dust3r_alt.exists()) or not gs_scene.is_dir():
+            print(
+                "ERROR: Stage 2 (InstantSplat) requires the dust3r and gaussian-splatting submodules to be initialized.\n"
+                "From the InstantSplat directory, run:\n"
+                "  cd instantsplat && git submodule update --init --recursive\n"
+                "Then install any dependencies required by those submodules (e.g. dust3r, 3D Gaussian Splatting)."
+            )
+            sys.exit(1)
+
+    if 1 in stages_enabled:
+        base_configs = _create_sat_patched_configs(
+            cogvideo_root,
+            args.sat_t5_dir,
+            args.sat_vae_ckpt,
+            args.sat_checkpoint_dir,
+        )
+    else:
+        base_configs = []
 
     print(f"\n{'='*80}")
     print("DimensionX Batch Pipeline Configuration")
@@ -438,6 +620,8 @@ Examples:
                 base_configs=base_configs,
                 seed=args.seed,
                 cogvideo_root=cogvideo_root,
+                instantsplat_root=instantsplat_root,
+                recon_cfg=recon_cfg,
             )
             all_results.append(result)
             if result["processed"]:
@@ -493,6 +677,7 @@ Examples:
             "sat_t5_dir": args.sat_t5_dir,
             "sat_vae_ckpt": args.sat_vae_ckpt,
             "cogvideo_root": str(cogvideo_root),
+            "instantsplat_root": str(instantsplat_root) if instantsplat_root else None,
             "dataset_dir": str(dataset_dir),
             "output_base": str(output_base),
         },

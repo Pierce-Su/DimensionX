@@ -266,6 +266,32 @@ def _build_case_tag(index: int, variant: str) -> str:
     return f"idx{index:04d}_{variant}"
 
 
+def _instantsplat_stage2_ply_path(
+    instantsplat_root: Path,
+    case_tag: str,
+    cfg: ReconStageConfig,
+) -> Path:
+    """
+    Return the expected final PLY path produced by InstantSplat 3DGS when invoked
+    with `--export_ply` (as this batch script does).
+    """
+    out_dir_name = (
+        f"output_{cfg.gs_iter}_lpips_{cfg.lambda_lpips}_use_conf"
+        if cfg.use_confidence
+        else f"output_{cfg.gs_iter}_lpips_{cfg.lambda_lpips}"
+    )
+    return (
+        instantsplat_root
+        / "data"
+        / "scenes"
+        / case_tag
+        / out_dir_name
+        / "point_cloud"
+        / f"iteration_{cfg.gs_iter}"
+        / "point_cloud.ply"
+    )
+
+
 def run_instantsplat_pipeline(
     video_path: Path,
     case_tag: str,
@@ -358,6 +384,7 @@ def process_sample(
     cogvideo_root: Path,
     instantsplat_root: Optional[Path],
     recon_cfg: Optional[ReconStageConfig],
+    force_stage2: bool,
 ) -> Dict:
     """Process one sample: photorealistic and/or stylized variants."""
     index = sample["index"]
@@ -428,15 +455,19 @@ def process_sample(
         elif instantsplat_root is None or recon_cfg is None:
             print(f"  Skipping Stage 2 (instantsplat not configured) for {variant_key} index {index}")
         else:
-            ok_3d = run_instantsplat_pipeline(
-                video_path=video_path,
-                case_tag=case_tag,
-                instantsplat_root=instantsplat_root,
-                cfg=recon_cfg,
-            )
-            if not ok_3d:
-                results["failed"].append(f"{variant_key}: {variant_data['filename']} (Stage 2 failed)")
-                return
+            expected_ply = _instantsplat_stage2_ply_path(instantsplat_root, case_tag, recon_cfg)
+            if not force_stage2 and expected_ply.exists():
+                print(f"  Stage 2 already complete for {case_tag} (found {expected_ply}); skipping.")
+            else:
+                ok_3d = run_instantsplat_pipeline(
+                    video_path=video_path,
+                    case_tag=case_tag,
+                    instantsplat_root=instantsplat_root,
+                    cfg=recon_cfg,
+                )
+                if not ok_3d:
+                    results["failed"].append(f"{variant_key}: {variant_data['filename']} (Stage 2 failed)")
+                    return
 
         results["processed"].append(f"{variant_key}: {variant_data['filename']}")
 
@@ -501,6 +532,11 @@ Examples:
                         help="Use Dust3R confidence in 3DGS (stage 2).")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Device for InstantSplat/Dust3R/3DGS (stage 2).")
+    parser.add_argument(
+        "--force_stage2",
+        action="store_true",
+        help="Re-run Stage 2 even if final outputs already exist for a sample.",
+    )
     parser.add_argument("--continue_on_error", action="store_true",
                         help="Continue processing if one sample fails")
 
@@ -622,6 +658,7 @@ Examples:
                 cogvideo_root=cogvideo_root,
                 instantsplat_root=instantsplat_root,
                 recon_cfg=recon_cfg,
+                force_stage2=args.force_stage2,
             )
             all_results.append(result)
             if result["processed"]:

@@ -31,6 +31,7 @@ import torchvision
 import subprocess
 import cv2
 import json
+import warnings
 
 # add lpips loss function
 from lpips import LPIPS
@@ -343,6 +344,14 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', type=str, default='bedroom_wo_video', help='dataset to use')
     parser.add_argument('--iter', type=int, default=1000, help='iteration to render')
     parser.add_argument('--lambda_lpips', type=float, default=0.0, help='lambda for lpips loss')
+    parser.add_argument(
+        '--lpips_device',
+        type=str,
+        default='auto',
+        choices=['auto', 'cuda', 'cpu', 'off'],
+        help='Device policy for LPIPS: auto tries CUDA then CPU fallback, cuda forces CUDA, '
+             'cpu forces CPU, off disables LPIPS regardless of lambda.',
+    )
     parser.add_argument('--use_render_config', type=str, default=None, help='render config to use')
     parser.add_argument('--use_confidence', action='store_true', help='use confidence map to when training')
     parser.add_argument(
@@ -387,9 +396,43 @@ if __name__ == '__main__':
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
-    # introduce lpips loss function to alleivate the inconsistency
-    lpips_loss = LPIPS(net='vgg').to("cuda")
-    lpips_loss.requires_grad_(False)
+    # Initialize LPIPS only when its weight is enabled.
+    # Some CUDA/OpenCV/PyTorch combinations can fail while moving LPIPS(VGG) to GPU.
+    lpips_loss = None
+    lpips_device = None
+    lpips_enabled = (args.lambda_lpips > 0) and (args.lpips_device != "off")
+    if lpips_enabled:
+        # Keep console noise low for known upstream deprecation/future warnings in LPIPS deps.
+        warnings.filterwarnings(
+            "ignore",
+            message="Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13",
+            category=UserWarning,
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message="You are using `torch.load` with `weights_only=False`",
+            category=FutureWarning,
+        )
+
+        if args.lpips_device == "cpu":
+            lpips_loss = LPIPS(net='vgg').to("cpu")
+            lpips_device = torch.device("cpu")
+            print("[INFO] LPIPS initialized on CPU.")
+        elif args.lpips_device == "cuda":
+            lpips_loss = LPIPS(net='vgg').to("cuda")
+            lpips_device = torch.device("cuda")
+            print("[INFO] LPIPS initialized on CUDA.")
+        else:
+            try:
+                lpips_loss = LPIPS(net='vgg').to("cuda")
+                lpips_device = torch.device("cuda")
+                print("[INFO] LPIPS initialized on CUDA.")
+            except RuntimeError as e:
+                print(f"[WARN] LPIPS CUDA init failed: {e}")
+                print("[WARN] Falling back to CPU LPIPS. Training will be slower.")
+                lpips_loss = LPIPS(net='vgg').to("cpu")
+                lpips_device = torch.device("cpu")
+        lpips_loss.requires_grad_(False)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -420,7 +463,12 @@ if __name__ == '__main__':
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
-        loss_lpips = lpips_loss(image, gt_image)
+        if lpips_loss is not None:
+            loss_lpips = lpips_loss(image.to(lpips_device), gt_image.to(lpips_device))
+            # Bring LPIPS scalar back to the training device for combined loss.
+            loss_lpips = loss_lpips.to(image.device)
+        else:
+            loss_lpips = torch.zeros(1, device=image.device, dtype=image.dtype)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + args.lambda_lpips * loss_lpips
 
         # if we use the extra confidence map to mitigate the negative impacts caused by inconsistent images

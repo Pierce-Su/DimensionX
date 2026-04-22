@@ -258,7 +258,7 @@ wget https://download.europe.naverlabs.com/ComputerVision/DUSt3R/DUSt3R_ViTLarge
 ```bash
 conda create -n instantsplat python=3.10.13 cmake=3.14.0 -y
 conda activate instantsplat
-conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia  # use the correct version of cuda for your system
+pip install torch==2.5.0 torchvision==0.20.0 torchaudio==2.5.0 --index-url https://download.pytorch.org/whl/cu121  # use the correct version of cuda for your system
 pip install -r requirements.txt
 pip install submodules/simple-knn
 pip install submodules/diff-gaussian-rasterization

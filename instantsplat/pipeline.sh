@@ -1,10 +1,13 @@
-CASE_NAME=horse
-NUM=50
-VIDEO_PATH='/pfs/mt-1oY5F7/chenshuo/CogVideo/sat/outputs/scene_180_109_6000/0_"A_majestic_bronze_horse_statue_stands_proudly_on_a_beige_pedestal_in_a_serene_park_setting._The_statue_captures_the_hor/0/000000.mp4'
+# CASE_NAME=horse
+CASE_NAME=cafe
+NUM=35
+VIDEO_PATH='./data/video/video.mp4'
+# VIDEO_PATH='/pfs/mt-1oY5F7/chenshuo/CogVideo/sat/outputs/scene_180_109_6000/0_"A_majestic_bronze_horse_statue_stands_proudly_on_a_beige_pedestal_in_a_serene_park_setting._The_statue_captures_the_hor/0/000000.mp4'
 
-export CUDA_VISIBLE_DEVICES=3
+export CUDA_VISIBLE_DEVICES=0
 
-python get_frame.py ${VIDEO_PATH} /pfs/mt-1oY5F7/chenshuo/instantsplat/data/images/${CASE_NAME}_${NUM} ${NUM}
+#python get_frame.py ${VIDEO_PATH} /pfs/mt-1oY5F7/chenshuo/instantsplat/data/images/${CASE_NAME}_${NUM} ${NUM}
+python get_frame.py ${VIDEO_PATH} ./data/images/${CASE_NAME}_${NUM} ${NUM}
 
 # dust3r to estimate the camera poses and initial point clouds
 python dust3r_inference.py --dataset ${CASE_NAME}_${NUM}
@@ -12,7 +15,9 @@ python dust3r_inference.py --dataset ${CASE_NAME}_${NUM}
 # dust3r on dynamicrafter generated videos
 # CUDA_VISIBLE_DEVICES=2 python dust3r_inference.py --dataset dynamicrafter_data/10_july/bedroom_3
 
-python 3dgs.py --dataset ${CASE_NAME}_${NUM}  --iter 10000 --use_confidence --lambda_lpips 0.3
+# python 3dgs.py --dataset ${CASE_NAME}_${NUM}  --iter 10000 --use_confidence --lambda_lpips 0.3
+python 3dgs.py --dataset ${CASE_NAME}_${NUM}  --iter 30000 --use_confidence --lambda_lpips 0.3
+
 
 # use the estimated camera poses and initial point clouds to optimize the 3dgs
 # python 3dgs.py --dataset horse --iter 2000

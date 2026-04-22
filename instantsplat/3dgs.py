@@ -26,7 +26,7 @@ from utils.image_utils import psnr
 from train import prepare_output_and_logger, training_report
 
 from utils.graphics_utils import focal2fov, fov2focal, getProjectionMatrix
-from utils.camera_utils import visualize_camera_trajectory
+# from utils.camera_utils import visualize_camera_trajectory
 import torchvision
 import subprocess
 import cv2
@@ -258,7 +258,7 @@ def render_path(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     os.makedirs(train_render_path, exist_ok=True)
 
     # visualize the camera trajectory
-    visualize_camera_trajectory(train_views, views, os.path.join(model_path, name, "ours_{}".format(iteration), "camera_trajectory.png"))
+    # visualize_camera_trajectory(train_views, views, os.path.join(model_path, name, "ours_{}".format(iteration), "camera_trajectory.png"))
 
     # render the scene with the training views
     for idx, view in enumerate(tqdm(train_views, desc="Rendering progress for training views")):

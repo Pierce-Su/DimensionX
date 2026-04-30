@@ -355,6 +355,20 @@ if __name__ == '__main__':
     parser.add_argument('--use_render_config', type=str, default=None, help='render config to use')
     parser.add_argument('--use_confidence', action='store_true', help='use confidence map to when training')
     parser.add_argument(
+        '--save_iterations',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Space-separated iterations to save gaussians, e.g. --save_iterations 30000',
+    )
+    parser.add_argument(
+        '--checkpoint_iterations',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Space-separated iterations to save checkpoints, e.g. --checkpoint_iterations 30000',
+    )
+    parser.add_argument(
         '--export_ply',
         action='store_true',
         help='If set, export the final 3D Gaussian point cloud as a PLY file alongside other outputs. '
@@ -379,8 +393,12 @@ if __name__ == '__main__':
     confidence_path = os.path.join(dataset.source_path, "confidence_map")
 
     testing_iterations = train_args.test_iterations
-    saving_iterations = train_args.save_iterations 
-    checkpoint_iterations = train_args.checkpoint_iterations 
+    saving_iterations = args.save_iterations if args.save_iterations is not None else train_args.save_iterations
+    checkpoint_iterations = (
+        args.checkpoint_iterations
+        if args.checkpoint_iterations is not None
+        else train_args.checkpoint_iterations
+    )
     checkpoint = train_args.start_checkpoint
     debug_from = train_args.debug_from
 
@@ -541,11 +559,18 @@ if __name__ == '__main__':
             # Export is non-critical; keep training outputs even if export fails.
             print(f"[WARN] Failed to export Gaussian PLY: {e}")
 
-    # render the scene
-    render_path(dataset, 1000, pipe, render_resize_method='original', use_render_config=args.use_render_config)
-    render_path(dataset, args.iter, pipe, render_resize_method='original', use_render_config=args.use_render_config)
-    if args.iter == 30000:
-        render_path(dataset, 30000, pipe, render_resize_method='original', use_render_config=args.use_render_config)
+    # Render only iterations that were actually saved.
+    render_iterations = []
+    for it in list(saving_iterations) + [args.iter]:
+        if it not in render_iterations:
+            render_iterations.append(it)
+
+    for it in render_iterations:
+        ply_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{it}", "point_cloud.ply")
+        if os.path.exists(ply_path):
+            render_path(dataset, it, pipe, render_resize_method='original', use_render_config=args.use_render_config)
+        else:
+            print(f"[WARN] Skip render for iteration {it}: missing {ply_path}")
 
 
 

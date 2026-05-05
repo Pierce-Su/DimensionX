@@ -160,14 +160,77 @@ def get_pc(imgs, pts3d, mask):
     imgs = to_numpy(imgs)          # [N_imgs, h, w, 3]
     pts3d = to_numpy(pts3d)        # length: 3, each element: numpy.array [272, 512, 3]
     mask = to_numpy(mask)
-    
-    # only take the first and last element
-    imgs = imgs[[0, -13]]
-    pts3d = [pts3d[i] for i in [0, -13]]
-    mask = [mask[i] for i in [0, -13]]
 
-    pts = np.concatenate([p[m] for p, m in zip(pts3d, mask)])        # concate each pointmap together, [N-img * h * w, 3]
-    col = np.concatenate([p[m] for p, m in zip(imgs, mask)])      # concate each image together, [N-img * h * w, 3]
+    num_imgs = len(imgs)
+    if num_imgs == 0:
+        raise RuntimeError("No images available to build point cloud.")
+
+    def _norm_idx(i):
+        # Support negative indices and clamp into valid range.
+        return i % num_imgs
+
+    def _extract_points(idxs):
+        sel_imgs = imgs[list(idxs)]
+        sel_pts3d = [pts3d[i] for i in idxs]
+        sel_mask = [mask[i] for i in idxs]
+        pts_local = np.concatenate([p[m] for p, m in zip(sel_pts3d, sel_mask)])
+        col_local = np.concatenate([p[m] for p, m in zip(sel_imgs, sel_mask)])
+        return pts_local, col_local
+
+    # Preferred pair from original script.
+    default_pair = (_norm_idx(0), _norm_idx(-13))
+
+    # Candidate fallback pairs spanning short/medium/long temporal gaps.
+    candidate_pairs = [
+        default_pair,
+        (_norm_idx(0), _norm_idx(-1)),
+        (_norm_idx(0), _norm_idx(num_imgs // 2)),
+        (_norm_idx(num_imgs // 4), _norm_idx((3 * num_imgs) // 4)),
+        (_norm_idx(num_imgs // 3), _norm_idx((2 * num_imgs) // 3)),
+    ]
+
+    # De-duplicate candidates while preserving order.
+    seen = set()
+    unique_pairs = []
+    for a, b in candidate_pairs:
+        if a == b:
+            continue
+        key = tuple(sorted((a, b)))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_pairs.append((a, b))
+
+    # Pick the pair with the most valid masked pixels.
+    best_pts = None
+    best_col = None
+    best_pair = None
+    best_count = -1
+    for pair in unique_pairs:
+        pts_try, col_try = _extract_points(pair)
+        cur_count = pts_try.shape[0]
+        if cur_count > best_count:
+            best_count = cur_count
+            best_pts = pts_try
+            best_col = col_try
+            best_pair = pair
+        if cur_count > 0 and pair == default_pair:
+            break
+
+    if best_count == 0:
+        # Last-resort fallback: use all images.
+        all_idxs = tuple(range(num_imgs))
+        all_pts, all_col = _extract_points(all_idxs)
+        if all_pts.shape[0] > 0:
+            print(f"[WARN] Default/fallback pairs produced 0 points; using all {num_imgs} frames.")
+            best_pts, best_col = all_pts, all_col
+        else:
+            print("[WARN] All frames still produced 0 points after masking.")
+    else:
+        print(f"[INFO] Using pair {best_pair} with {best_count} valid points.")
+
+    pts = best_pts
+    col = best_col
     
     # original writing
     # pts = pts.reshape(-1, 3)[::3]           # 每隔3个取一个作为初始点云

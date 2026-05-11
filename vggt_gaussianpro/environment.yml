@@ -1,0 +1,32 @@
+name: vggt_gp
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch::pytorch>=2.1
+  - pytorch::torchvision
+  - nvidia::pytorch-cuda=11.8
+  - conda-forge::opencv
+  - conda-forge::numpy
+  - conda-forge::pillow
+  - conda-forge::scipy
+  - pip:
+      # VGGT core deps
+      - huggingface_hub
+      - einops
+      - safetensors
+      # COLMAP binary I/O (required by vggt.dependency.np_to_pycolmap)
+      - pycolmap
+      # 3D / visualisation
+      - trimesh
+      - plyfile
+      # BA tracker deps (only needed with --use_ba)
+      - lightglue
+      # Misc
+      - tqdm
+      - tensorboard
+      - matplotlib

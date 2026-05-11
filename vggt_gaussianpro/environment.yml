@@ -1,20 +1,22 @@
 name: vggt_gp
 channels:
+  - conda-forge
   - pytorch
   - nvidia
-  - conda-forge
   - defaults
 dependencies:
   - python=3.10
   - pip
-  - pytorch::pytorch>=2.1
-  - pytorch::torchvision
-  - nvidia::pytorch-cuda=11.8
   - conda-forge::opencv
   - conda-forge::numpy
   - conda-forge::pillow
   - conda-forge::scipy
   - pip:
+      # Force CUDA 12.8 torch wheels; all other packages fall back to PyPI
+      - --index-url https://download.pytorch.org/whl/cu128
+      - --extra-index-url https://pypi.org/simple
+      - torch>=2.9
+      - torchvision
       # VGGT core deps
       - huggingface_hub
       - einops
@@ -25,8 +27,22 @@ dependencies:
       - trimesh
       - plyfile
       # BA tracker deps (only needed with --use_ba)
-      - lightglue
+      - git+https://github.com/cvg/LightGlue.git
       # Misc
       - tqdm
       - tensorboard
       - matplotlib
+      - open3d
+      # GaussianPro runtime deps
+      - imageio          # used by train.py and render.py for frame I/O
+      - imageio-ffmpeg   # imageio video backend (optional but avoids runtime warnings)
+      # GaussianPro CUDA extensions — build from submodules after env creation:
+      #   pip install --no-build-isolation \
+      #       third_party/GaussianPro/submodules/diff-gaussian-rasterization \
+      #       third_party/GaussianPro/submodules/simple-knn \
+      #       third_party/GaussianPro/submodules/Propagation
+      #
+      # NOTE: the following patches are already applied in the submodule source tree:
+      #   • diff-gaussian-rasterization/cuda_rasterizer/rasterizer_impl.h — add #include <cstdint>
+      #   • simple-knn/simple_knn.cu                                       — add #include <cfloat>
+      # Both are required for CUDA 12+ / C++17 toolchains.

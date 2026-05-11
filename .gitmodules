@@ -7,3 +7,6 @@
 [submodule "vggt_gaussianpro/third_party/vggt"]
 	path = vggt_gaussianpro/third_party/vggt
 	url = https://github.com/Pierce-Su/vggt.git
+[submodule "vggt_gaussianpro/third_party/GaussianPro"]
+	path = vggt_gaussianpro/third_party/GaussianPro
+	url = https://github.com/Pierce-Su/GaussianPro.git

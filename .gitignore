@@ -82,6 +82,7 @@ venv.bak/
 /CogVideoX-2b-sat/
 /sat_weights/
 /instantsplat/data/
+/vggt_gaussianpro/data/
 
 
 # --- IDE / Editor ---

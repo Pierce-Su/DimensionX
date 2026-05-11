@@ -62,7 +62,9 @@ from utils.depth_to_normal import batch_point_map_to_normals
 # ---------------------------------------------------------------------------
 VGGT_FIXED_RESOLUTION = 518   # resolution VGGT runs at internally
 IMG_LOAD_RESOLUTION   = 1024  # resolution images are loaded at before feeding to VGGT
-CONF_THRES_VALUE      = 5.0   # depth confidence threshold (no-BA path)
+CONF_THRES_VALUE      = 5.0   # depth confidence threshold (no-BA path) — default matches VGGT demo
+CONF_THRES_FALLBACK_PERCENTILE = 80  # percentile fallback when absolute threshold yields < MIN_POINTS
+MIN_POINTS_BEFORE_FALLBACK     = 1_000
 MAX_POINTS_FOR_COLMAP = 100_000
 
 
@@ -153,6 +155,26 @@ def parse_args():
     parser.add_argument(
         "--fine_tracking", action="store_true", default=True,
         help="Use fine-grained tracking during BA (slower but more accurate).",
+    )
+    # --- depth confidence filter ---
+    parser.add_argument(
+        "--conf_thres_value", type=float, default=CONF_THRES_VALUE,
+        help="Absolute confidence threshold for depth-map filtering (no-BA path). "
+             "Only pixels with confidence >= this value are kept. "
+             "With VGGT's expp1 activation the minimum possible value is 1.0; "
+             "typical in-distribution scenes yield values of 5–50+. "
+             "For out-of-distribution footage (aerial, satellite, etc.) all confidences "
+             "collapse to ~1.0 and the fallback percentile logic takes over automatically. "
+             "Default: 5.0 (matches the original VGGT demo_colmap.py).",
+    )
+    # --- memory / frame budget ---
+    parser.add_argument(
+        "--max_frames", type=int, default=None,
+        help="Maximum number of frames fed to VGGT. "
+             "When the extracted frame count exceeds this value the frames are "
+             "uniformly subsampled before the VGGT forward pass. "
+             "Recommended: ≤48 for 48 GB VRAM, ≤32 for 24 GB VRAM. "
+             "Default: no limit (use all frames).",
     )
     # --- misc ---
     parser.add_argument("--seed",     type=int, default=42)
@@ -315,13 +337,17 @@ def save_depth_confidence_normals(
     for d in (depth_dir, conf_dir, norm_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    normals = batch_point_map_to_normals(points_3d)  # (N, H, W, 3)
+    normals = batch_point_map_to_normals(points_3d)  # (N, H, W, 3), unit vectors in [-1, 1]
 
     N = depth_map.shape[0]
     for i in range(N):
         np.save(str(depth_dir / f"{i}.npy"), depth_map[i].astype(np.float32))
         np.save(str(conf_dir  / f"{i}.npy"), depth_conf[i].astype(np.float32))
-        np.save(str(norm_dir  / f"{i}.npy"), normals[i])
+        # Store normals as (3, H, W) in [0, 1] range.
+        # GaussianPro's loadCam applies .transpose((1,2,0)) expecting channels-first (3,H,W)
+        # input, then applies (n - 0.5) * 2 to recover [-1, 1] unit vectors.
+        normal_01 = ((normals[i] + 1.0) / 2.0).astype(np.float32)       # (H, W, 3)
+        np.save(str(norm_dir  / f"{i}.npy"), np.transpose(normal_01, (2, 0, 1)))  # (3, H, W)
 
     print(f"Saved depth maps, confidence maps, normals for {N} frames.")
 
@@ -380,6 +406,18 @@ def main():
     image_path_list = collect_image_paths(images_dir)
     base_names      = [p.name for p in image_path_list]
     print(f"Found {len(image_path_list)} images in {images_dir}")
+
+    # ------------------------------------------------------ frame subsampling
+    if args.max_frames is not None and len(image_path_list) > args.max_frames:
+        total = len(image_path_list)
+        indices = [round(i * (total - 1) / (args.max_frames - 1))
+                   for i in range(args.max_frames)]
+        image_path_list = [image_path_list[i] for i in indices]
+        base_names      = [p.name for p in image_path_list]
+        print(
+            f"[vggt_inference] --max_frames={args.max_frames}: "
+            f"uniformly subsampled {total} → {len(image_path_list)} frames"
+        )
 
     # Copy frames into scene images/ so the COLMAP reconstruction is self-contained.
     for src in image_path_list:
@@ -469,7 +507,24 @@ def main():
         # (N, H, W, 3) — pixel coordinates + frame index per valid point
         points_xyf = create_pixel_coordinate_grid(N, H, W)
 
-        conf_mask = depth_conf >= CONF_THRES_VALUE
+        conf_mask = depth_conf >= args.conf_thres_value
+        n_above = int(conf_mask.sum())
+
+        if n_above < MIN_POINTS_BEFORE_FALLBACK:
+            # Out-of-distribution scenes (aerial, satellite, …) make VGGT produce
+            # very low confidence everywhere (all values ≈ 1.0 with expp1 activation).
+            # Fall back to keeping the top CONF_THRES_FALLBACK_PERCENTILE% of pixels
+            # by confidence so the point cloud is never empty.
+            fallback_thres = float(np.percentile(depth_conf, CONF_THRES_FALLBACK_PERCENTILE))
+            print(
+                f"[vggt_inference] WARNING: only {n_above} pixels pass the absolute "
+                f"confidence threshold ({args.conf_thres_value}). "
+                f"Conf-value range: [{depth_conf.min():.4f}, {depth_conf.max():.4f}]. "
+                f"Falling back to top-{100 - CONF_THRES_FALLBACK_PERCENTILE}% percentile "
+                f"threshold = {fallback_thres:.6f}."
+            )
+            conf_mask = depth_conf >= fallback_thres
+
         conf_mask = randomly_limit_trues(conf_mask, MAX_POINTS_FOR_COLMAP)
 
         pts_filtered   = points_3d[conf_mask]

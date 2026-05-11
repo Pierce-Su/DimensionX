@@ -4,3 +4,6 @@
 [submodule "instantsplat/gaussian-splatting"]
 	path = instantsplat/gaussian-splatting
 	url = https://github.com/graphdeco-inria/gaussian-splatting.git
+[submodule "vggt_gaussianpro/third_party/vggt"]
+	path = vggt_gaussianpro/third_party/vggt
+	url = https://github.com/Pierce-Su/vggt.git

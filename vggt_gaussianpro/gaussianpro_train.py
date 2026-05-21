@@ -121,6 +121,18 @@ def parse_args() -> argparse.Namespace:
     )
     # --- misc ---
     parser.add_argument(
+        "--save_iterations", type=int, nargs="+", default=None,
+        help="Override which iterations to save point clouds "
+             "(e.g. --save_iterations 30000).  When omitted, defaults to "
+             "{1, 7000, min(20000, iter), iter}.",
+    )
+    parser.add_argument(
+        "--checkpoint_iterations", type=int, nargs="+", default=None,
+        help="Iterations at which to write .pth checkpoints "
+             "(e.g. --checkpoint_iterations 30000).  When omitted, no "
+             "checkpoints are written.",
+    )
+    parser.add_argument(
         "--export_ply", action="store_true", default=False,
         help="(informational) GaussianPro always saves point_cloud.ply at "
              "save_iterations; this flag is accepted for CLI parity.",
@@ -270,8 +282,18 @@ def main() -> None:
         ensure_metricdepth_link(scene_dir)
 
     # ----------------------------------------------------- build subprocess command
-    save_iters = sorted({1, 7_000, min(20_000, args.iter), args.iter})
-    test_iters = sorted({1, 2_000, 7_000, min(20_000, args.iter), args.iter})
+    if args.save_iterations is not None:
+        save_iters = sorted(set(args.save_iterations))
+    else:
+        save_iters = sorted({1, 7_000, min(20_000, args.iter), args.iter})
+
+    # test_iterations drives per-iteration PSNR logging in GaussianPro; keep it
+    # aligned with save_iters when the caller has restricted saves to a single
+    # checkpoint so intermediate logs are not written for discarded iterations.
+    if args.save_iterations is not None:
+        test_iters = save_iters
+    else:
+        test_iters = sorted({1, 2_000, 7_000, min(20_000, args.iter), args.iter})
 
     cmd = [
         sys.executable,
@@ -287,6 +309,10 @@ def main() -> None:
         "--test_iterations", *[str(it) for it in test_iters],
         "--port",          str(args.port),
     ]
+
+    if args.checkpoint_iterations is not None:
+        chkpt_iters = sorted(set(args.checkpoint_iterations))
+        cmd += ["--checkpoint_iterations", *[str(it) for it in chkpt_iters]]
 
     if args.use_depth_prior:
         cmd += [

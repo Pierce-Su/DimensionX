@@ -15,13 +15,14 @@
 4. [Stage B — VGGT Geometry Estimation (`vggt_inference.py`)](#4-stage-b--vggt-geometry-estimation-vggt_inferencepy)
 5. [Stage C — GaussianPro Optimization (`gaussianpro_train.py`)](#5-stage-c--gaussianpro-optimization-gaussianpro_trainpy)
 6. [Stage D — Rendering (`gaussianpro_render.py`)](#6-stage-d--rendering-gaussianpro_renderpy)
-7. [Utility: `utils/depth_to_normal.py`](#7-utility-utilsdepth_to_normalpy)
-8. [Orchestration Scripts](#8-orchestration-scripts)
-9. [Data Contracts](#9-data-contracts)
-10. [Environment and Dependencies](#10-environment-and-dependencies)
-11. [Observed Run: `index_0003`](#11-observed-run-index_0003)
-12. [Deviations from PRD](#12-deviations-from-prd)
-13. [Known Issues and Quirks](#13-known-issues-and-quirks)
+7. [Stage E — Ellipse-Orbit Render (`gaussianpro_render_path.py`)](#7-stage-e--ellipse-orbit-render-gaussianpro_render_pathpy)
+8. [Utility: `utils/depth_to_normal.py`](#8-utility-utilsdepth_to_normalpy)
+9. [Orchestration Scripts](#9-orchestration-scripts)
+10. [Data Contracts](#10-data-contracts)
+11. [Environment and Dependencies](#11-environment-and-dependencies)
+12. [Observed Run: `index_0003`](#12-observed-run-index_0003)
+13. [Deviations from PRD](#13-deviations-from-prd)
+14. [Known Issues and Quirks](#14-known-issues-and-quirks)
 
 ---
 
@@ -62,11 +63,14 @@ This pipeline is **self-contained** under `vggt_gaussianpro/` and does not modif
 ```
 vggt_gaussianpro/
 ├── pipeline.sh                 single-scene end-to-end runner
-├── batch_pipeline.sh           multi-scene batch runner
+├── batch_pipeline.sh           multi-scene batch runner (Stages A–D)
+├── batch_render_path.sh        batch ellipse-orbit render runner (Stage E)
 ├── get_frame.py                Stage A: video → PNG frames
 ├── vggt_inference.py           Stage B: VGGT geometry estimation
 ├── gaussianpro_train.py        Stage C: GaussianPro optimization wrapper
-├── gaussianpro_render.py       Stage D: GaussianPro render wrapper
+├── gaussianpro_render.py       Stage D: GaussianPro render wrapper (train/test views)
+├── gaussianpro_render_path.py          Stage E: ellipse-orbit orchestrator (no GP imports)
+├── _gaussianpro_render_path_worker.py  Stage E: GaussianPro render worker (subprocess)
 ├── utils/
 │   ├── __init__.py
 │   └── depth_to_normal.py      surface normal computation from point maps
@@ -243,8 +247,10 @@ The subprocess runs with:
 - `CUDA_VISIBLE_DEVICES` set from `--device` index.
 - A `cost/` directory pre-created in the GaussianPro root (GaussianPro's propagation step writes debug images there; it doesn't create the directory itself).
 
-Checkpoint save iterations: `{1, 7000, min(20000, iter), iter}` (always includes 1 and 7000).
-Test render iterations: `{1, 2000, 7000, min(20000, iter), iter}`.
+Default checkpoint save iterations: `{1, 7000, min(20000, iter), iter}` (always includes 1 and 7000).  
+Default test render iterations: `{1, 2000, 7000, min(20000, iter), iter}`.
+
+Both sets can be overridden via `--save_iterations` and `--checkpoint_iterations` (see CLI).  When `--save_iterations` is provided, `test_iterations` is also narrowed to the same set so GaussianPro does not log intermediate metrics for iterations that will not be saved.
 
 ### Depth Prior Mode (`--use_depth_prior`)
 
@@ -288,6 +294,8 @@ python gaussianpro_train.py \
     [--propagation_start 1000]
     [--propagation_end 12000]
     [--patch_size 20]
+    [--save_iterations 30000]          # override save schedule; replaces default {1,7000,20000,iter}
+    [--checkpoint_iterations 30000]    # write .pth checkpoints at these iterations (none by default)
     [--eval]                           # LLFF-style test split during training
     [--export_ply]                     # accepted for CLI parity; GaussianPro always writes PLY
     [--device cuda:0]
@@ -295,6 +303,8 @@ python gaussianpro_train.py \
 ```
 
 ### Output Structure
+
+Default (full save schedule):
 
 ```
 data/scenes/{dataset}/output_{iter}_gp[_depth_prior]/
@@ -307,6 +317,19 @@ data/scenes/{dataset}/output_{iter}_gp[_depth_prior]/
 ├── cameras.json
 ├── cfg_args                         Namespace dump of all GaussianPro train arguments
 └── events.out.tfevents.*            TensorBoard logs
+```
+
+When `--save_iterations {iter} --checkpoint_iterations {iter}` is passed (e.g. via `GP_SAVE_ONLY_FINAL=1` in `batch_pipeline.sh`), intermediate checkpoints are suppressed and only the final iteration is written:
+
+```
+data/scenes/{dataset}/output_{iter}_gp[_depth_prior]/
+├── input.ply
+├── point_cloud/
+│   └── iteration_{iter}/point_cloud.ply   (only the final iteration)
+├── chkpnt_{iter}.pth                       .pth checkpoint (only the final iteration)
+├── cameras.json
+├── cfg_args
+└── events.out.tfevents.*
 ```
 
 ---
@@ -358,7 +381,128 @@ output_{iter}_gp[_depth_prior]/
 
 ---
 
-## 7. Utility: `utils/depth_to_normal.py`
+## 7. Stage E — Ellipse-Orbit Render (`gaussianpro_render_path.py`)
+
+### Purpose
+
+Generates a smooth 120-frame novel-view orbit video from a trained GaussianPro checkpoint, mirroring the `render_path()` function in InstantSplat's `3dgs.py`. The orbit is derived entirely from the existing training-camera poses — no additional camera data is required.
+
+Stage D (`gaussianpro_render.py`) renders only the captured training and test views. Stage E synthesises a continuous camera trajectory that orbits the scene, making it suitable for visual quality assessment and side-by-side comparisons with InstantSplat output.
+
+### Two-File Architecture
+
+Stage E is split into two scripts to avoid a `ModuleNotFoundError` that occurs when GaussianPro's `utils` package conflicts with the VGGT installation's `utils` package already cached in `sys.modules`:
+
+| File | Role | GaussianPro imports? |
+|---|---|---|
+| `gaussianpro_render_path.py` | Orchestrator: reads `cameras.json`, generates ellipse orbit (pure NumPy/SciPy), serialises camera params to a temp JSON, invokes the worker as a subprocess | **No** |
+| `_gaussianpro_render_path_worker.py` | Worker: invoked by subprocess with `cwd=GaussianPro_root` and `PYTHONPATH=GaussianPro_root`; builds `Camera` objects, loads Gaussians from PLY, renders, writes PNGs + MP4 | **Yes** |
+
+This pattern mirrors every other stage wrapper in the pipeline (`gaussianpro_render.py`, `gaussianpro_train.py`).
+
+**Inter-process data contract** — the orchestrator writes a single temp JSON file with two lists:
+```json
+{
+  "train_cams": [{"uid": 0, "image_name": "00000.png", "R_cam": [[...]], "T_cam": [...],
+                  "FoVx": 1.047, "FoVy": 0.785, "fx": 500.0, "fy": 500.0,
+                  "width": 720, "height": 480}, ...],
+  "orbit_cams": [...]
+}
+```
+`R_cam` and `T_cam` are in GaussianPro's convention (`R_cam = W2C_rotation.T`, `T_cam = W2C_translation`), derived from the C2W rotation and position stored in `cameras.json`.
+
+### Algorithm: Ellipse Path Generation
+
+The orbit is produced by the same algorithm used in `instantsplat/gaussian-splatting/utils/camera_utils.py` (`generate_ellipse_path_from_camera_infos`), ported inline into `gaussianpro_render_path.py` (the orchestrator):
+
+1. **C2W extraction** — Training-camera poses are read from `<model_path>/cameras.json`, which stores the camera-to-world (C2W) rotation and position for every camera. No GaussianPro Scene loading is required.
+2. **Axis convention flip** — Columns 1 and 2 of each C2W are negated (`poses[:, :, 1:3] *= -1`) to convert from OpenCV (Y-down, Z-forward) to the NeRF/instantsplat (Y-up, Z-back) convention required by the ellipse algorithm.
+3. **PCA alignment** (`_transform_poses_pca`) — Poses are re-centred on their mean translation, then rotated so their principal components align with XYZ axes; scale is normalised to the unit cube. This ensures the ellipse is well-formed regardless of scene scale or orientation.
+4. **Ellipse generation** (`_generate_ellipse_path`) — An ellipse is fit to the XY spread of the PCA-aligned positions (Z is held at 0). A constant arc-length resampling is applied via `np.interp` on the cumulative arc length, ensuring uniform apparent camera speed in the output video.
+5. **Inverse PCA** (`_invert_transform_poses_pca`) — Orbit poses are mapped back to the original world coordinate frame.
+6. **Axis convention flip back** — Columns 1 and 2 are negated again to return to OpenCV convention.
+7. **Serialisation** — Orbit and train camera params (R_cam, T_cam, FoVx, FoVy, fx, fy, width, height) are written to a temp JSON and passed to the worker subprocess.
+8. **Camera construction (worker)** — The worker builds GaussianPro `Camera` objects from the JSON params. Intrinsics (FoVx, FoVy, K=[fx, fy, cx, cy]) are borrowed from the first training camera. A blank `(3, H, W)` image tensor serves as the dummy ground-truth (not needed for rendering).
+9. **Gaussian loading (worker)** — The worker loads `point_cloud.ply` directly via `GaussianModel.load_ply()`, bypassing GaussianPro's `Scene` loader (no COLMAP re-read required).
+
+### Resize Strategy
+
+Orbit frames are optionally resized before rasterisation, matching the `render_resize_method` logic in InstantSplat's `render_path()`:
+
+| `--resize` | Rasterisation resolution | Notes |
+|---|---|---|
+| `crop` (default) | 512 × 512 | Square crop; `FoVx`/`FoVy` recalculated to preserve focal length |
+| `pad` | `max(W, H) × max(W, H)` | Square pad at the larger dimension |
+| `original` | Native camera resolution | No resize; uses each camera's own width × height |
+
+After resizing, `projection_matrix` and `full_proj_transform` are recalculated from the updated FoV.
+
+### Video Assembly
+
+After all PNG frames are written, `cv2.VideoWriter` (codec `mp4v`) stitches them into an MP4 at `--fps` (default 30).  Frames are collected in sorted filename order (`00000.png` → `00119.png`).
+
+### CLI
+
+```bash
+python gaussianpro_render_path.py \
+    --model_path  data/scenes/<dataset>/output_30000_gp_depth_prior/ \
+    --source_path data/scenes/<dataset>/
+    [--iteration  -1]           # -1 = latest checkpoint
+    [--n_frames   120]          # orbit frame count
+    [--resize     crop]         # crop | pad | original
+    [--fps        30]           # output MP4 frame rate
+    [--white_background]        # use white instead of black background
+    [--device     cuda:0]
+    [--quiet]                   # suppress tqdm progress bars
+```
+
+| Argument | Type | Default | Notes |
+|---|---|---|---|
+| `--model_path` | str | required | Trained GaussianPro model directory |
+| `--source_path` | str | required | COLMAP scene directory (contains `sparse/`) |
+| `--iteration` | int | `-1` | Checkpoint iteration; `-1` loads the latest from `point_cloud/` |
+| `--n_frames` | int | `120` | Number of orbit frames; matches InstantSplat default |
+| `--resize` | str | `crop` | Frame resize strategy: `crop` → 512², `pad` → square at max dim, `original` → native |
+| `--fps` | int | `30` | Output video frame rate |
+| `--white_background` | flag | off | Renders against white background |
+| `--device` | str | `cuda:0` | Sets `CUDA_VISIBLE_DEVICES` from the index component |
+| `--quiet` | flag | off | Suppress tqdm bars |
+
+### Output Structure
+
+```
+output_{iter}_gp[_depth_prior]/
+└── render/
+    └── ours_{iter}/
+        ├── renders/
+        │   ├── 00000.png                  orbit frame 0
+        │   ├── 00001.png
+        │   ⋮
+        │   └── 001{N-1}.png               orbit frame N-1
+        ├── interpolation_renders.mp4      stitched orbit video (default: 120 frames @ 30 fps)
+        ├── train_renders/
+        │   ├── 00000.png                  re-rendered training view 0
+        │   ⋮
+        │   └── 000{M-1}.png
+        └── train_renders.mp4              stitched training-view video
+```
+
+> **Naming note:** the output root is `render/` (not `train/` or `test/`), matching InstantSplat's `render_path()` convention and distinguishing Stage E output from Stage D.
+
+### Relationship to InstantSplat
+
+| Aspect | InstantSplat (`3dgs.py render_path`) | GaussianPro Stage E (`gaussianpro_render_path.py`) |
+|---|---|---|
+| Orbit algorithm | `generate_ellipse_path_from_camera_infos` in `camera_utils.py`, called at Scene init | Same algorithm ported inline into orchestrator; runs on poses read from `cameras.json` |
+| Scene loading | InstantSplat's `Scene` (has `getRenderCameras()`) | No Scene load needed; poses from `cameras.json`, Gaussians from PLY via `GaussianModel.load_ply()` |
+| Intrinsics source | Per-orbit camera from `camera_utils.CameraInfo` | First training camera's fx/fy/width/height from `cameras.json` |
+| Depth/normal output | Not rendered in `render_path` | Not rendered (Stage D handles those) |
+| Resize modes | `crop` / `pad` / `original` | Same three modes |
+| Video codec | `cv2.VideoWriter` @ 30 fps | Same |
+
+---
+
+## 8. Utility: `utils/depth_to_normal.py`
 
 ### `point_map_to_normals(points_3d: np.ndarray) → np.ndarray`
 
@@ -382,7 +526,7 @@ Vectorised wrapper over `point_map_to_normals`.
 
 ---
 
-## 8. Orchestration Scripts
+## 9. Orchestration Scripts
 
 ### `pipeline.sh` (single scene)
 
@@ -407,28 +551,186 @@ All configuration is controlled via environment variables, with sensible default
 
 Stage D (render) is skipped if `SKIP_RENDER=1`. When render runs, `--eval` is passed unless `SKIP_EVAL=1`.
 
-### `batch_pipeline.sh` (multi-scene)
+#### Quick-start examples
 
-Iterates over `${DATAROOT}/${TYPE}/index_*/video.mp4` for each type in `${TYPES}`.
+```bash
+# 1. Minimal run — all defaults (48-frame cap, depth prior, render + eval on)
+bash pipeline.sh
 
-Key differences from `pipeline.sh`:
+# 2. Point at a specific video
+VIDEO_PATH=/data/my_clip.mp4 bash pipeline.sh
+
+# 3. Custom dataset name, second GPU, disable render
+VIDEO_PATH=/data/my_clip.mp4 \
+DATASET=my_scene \
+DEVICE=cuda:1 \
+SKIP_RENDER=1 \
+bash pipeline.sh
+
+# 4. Enable bundle-adjustment refinement and export a .glb mesh
+VIDEO_PATH=/data/my_clip.mp4 \
+USE_BA=--use_ba \
+SAVE_GLB=--save_glb \
+bash pipeline.sh
+
+# 5. Fast preview — 1000 iterations, no render
+VIDEO_PATH=/data/my_clip.mp4 \
+GP_ITER=1000 \
+SKIP_RENDER=1 \
+bash pipeline.sh
+
+# 6. Full evaluation run — train on all frames, render train + test splits
+VIDEO_PATH=/data/my_clip.mp4 \
+SKIP_RENDER="" \
+SKIP_EVAL="" \
+bash pipeline.sh
+
+# 7. Disable depth prior (plain GaussianPro, no VGGT depth injection)
+VIDEO_PATH=/data/my_clip.mp4 \
+USE_DEPTH_PRIOR="" \
+bash pipeline.sh
+```
+
+### `batch_pipeline.sh` (multi-scene, Stages A–D)
+
+Iterates over `${DATAROOT}/${TYPE}/index_*/video.mp4` for each `TYPE` in `${TYPES}`.
+
+#### Dataset naming
+
+Per-scene dataset name: `{TYPE}_{INDEX_DIR}` where `INDEX_DIR = basename(dirname(VIDEO_PATH))`.
+
+Example — for `DATAROOT/.../photorealistic/index_0003/video.mp4`:
+```
+TYPE          = photorealistic
+INDEX_DIR     = index_0003
+DATASET       = photorealistic_index_0003
+output folder = data/scenes/photorealistic_index_0003/output_30000_gp_depth_prior/
+```
+
+This naming encodes both the style category (`photorealistic` / `stylized`) and the scene index in every output path.
+
+#### Environment variables
+
+All variables from `pipeline.sh` are supported. Batch-specific defaults and additions:
 
 | Variable | Batch Default | Notes |
 |---|---|---|
-| `DATAROOT` | `./workspace/DimensionX/data/dimensionx_batch_sat360` | Override per batch |
-| `TYPES` | `orbit dolly` | Space-separated |
-| `SKIP_RENDER` | `1` (skipped) | Render disabled by default in batch mode |
-| `MAX_FRAMES` | not set (unlimited) | No frame cap in batch mode |
+| `DATAROOT` | `./workspace/DimensionX/data/dimensionx_batch_sat360` | Root containing `photorealistic/` and `stylized/` subdirs |
+| `TYPES` | `photorealistic stylized` | Space-separated style categories; must match subdirectory names under `DATAROOT` |
+| `NUM_FRAMES` | empty (all frames) | Passed to `get_frame.py`; empty = all |
+| `DEVICE` | `cuda:0` | Torch device |
+| `USE_BA` | empty (disabled) | Set to `--use_ba` to enable bundle adjustment |
+| `SAVE_GLB` | empty (disabled) | Set to `--save_glb` to write `scene.glb` |
+| `MAX_FRAMES` | `48` | VGGT frame budget; same default as `pipeline.sh` |
+| `CONF_THRES` | empty (code default 5.0) | Absolute confidence threshold |
+| `GP_ITER` | `30000` | GaussianPro training iterations |
+| `GP_LAMBDA_LPIPS` | `0.3` | Perceptual loss weight (CLI parity) |
+| `USE_DEPTH_PRIOR` | `1` (enabled) | Set to empty to disable |
+| `GP_SAVE_ONLY_FINAL` | `1` (enabled) | When set, passes `--save_iterations ${GP_ITER} --checkpoint_iterations ${GP_ITER}` so only the final iteration is written to disk; set to empty to restore the full default schedule `{1, 7000, 20000, iter}` |
+| `SKIP_RENDER` | `1` (skipped) | Render disabled by default in batch mode; set to empty to enable |
+| `SKIP_EVAL` | empty (eval enabled) | Set to `1` to omit `--eval` from Stage D renders |
+| `CUDA_VISIBLE_DEVICES` | `0` | Exported to environment |
 
-Per-scene dataset name: `{TYPE}_{ID}` where `ID = basename(dirname(VIDEO_PATH))`.
+#### Error handling
 
-Error handling: per-scene failures increment a `FAIL` counter and `continue` to the next scene; the batch does not abort on a single failure. Final summary prints `success=N failed=M`.
+Per-scene failures increment a `FAIL` counter and `continue` to the next scene; the batch does not abort on a single failure. Final summary prints `success=N failed=M`.
+
+The arithmetic `(( FAIL++ )) || true` pattern is used throughout to remain safe under `set -euo pipefail`, which would otherwise treat a zero-valued arithmetic expression as a non-zero exit code.
+
+#### Quick-start examples
+
+```bash
+# 1. Minimal run — all defaults
+#    Processes photorealistic/ and stylized/ under the default DATAROOT.
+#    Saves only the iteration-30000 point cloud and checkpoint per scene.
+bash batch_pipeline.sh
+
+# 2. Custom data root, specific GPU
+DATAROOT=/mnt/datasets/my_batch \
+DEVICE=cuda:1 \
+bash batch_pipeline.sh
+
+# 3. Process only the photorealistic subset
+DATAROOT=/mnt/datasets/my_batch \
+TYPES="photorealistic" \
+bash batch_pipeline.sh
+
+# 4. Also run Stage D renders after training
+SKIP_RENDER="" bash batch_pipeline.sh
+
+# 5. Restore the full checkpoint schedule (save at 1, 7k, 20k, 30k)
+GP_SAVE_ONLY_FINAL="" bash batch_pipeline.sh
+
+# 6. Disable depth prior — plain GaussianPro for every scene
+USE_DEPTH_PRIOR="" bash batch_pipeline.sh
+
+# 7. Higher frame cap for large-VRAM machines (e.g. 80 GB A100)
+MAX_FRAMES=96 bash batch_pipeline.sh
+
+# 8. Dry-run check — override DATAROOT and TYPES to a small test set
+DATAROOT=/tmp/test_batch \
+TYPES="photorealistic" \
+GP_ITER=500 \
+SKIP_RENDER=1 \
+bash batch_pipeline.sh
+```
+
+### `batch_render_path.sh` (multi-scene, Stage E)
+
+Iterates over every subdirectory of `SCENES_DIR` and runs `gaussianpro_render_path.py` for each trained scene.
+
+#### Skip logic
+
+Two independent skip conditions prevent redundant work:
+
+1. **No checkpoint** — if `${MODEL_PATH}/point_cloud/` does not exist, the scene is counted as "skipped" and the loop continues silently.
+2. **Already rendered** (`SKIP_EXISTING=1`, default) — the latest iteration is inferred by listing `point_cloud/iteration_*/` directory names; if `render/ours_{iter}/interpolation_renders.mp4` already exists, the scene is skipped. Set `SKIP_EXISTING=""` to force re-render.
+
+#### Environment variables
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SCENES_DIR` | `${SCRIPT_DIR}/data/scenes` | Root containing one subdirectory per dataset |
+| `GP_ITER` | `30000` | Used to build the model directory suffix |
+| `USE_DEPTH_PRIOR` | `1` (enabled) | When set, appends `_depth_prior` to the model suffix; set to `""` for plain `output_{iter}_gp/` |
+| `N_FRAMES` | `120` | Number of orbit frames passed to `--n_frames` |
+| `RESIZE` | `crop` | Passed to `--resize`; `crop` → 512², `pad` → square at max dim, `original` → native |
+| `FPS` | `30` | Output video frame rate |
+| `DEVICE` | `cuda:0` | Torch device string; index component sets `CUDA_VISIBLE_DEVICES` |
+| `WHITE_BG` | empty (black) | Set to `1` to pass `--white_background` |
+| `SKIP_EXISTING` | `1` (skip) | Set to `""` to re-render scenes that already have `interpolation_renders.mp4` |
+
+#### Error handling
+
+Mirrors `batch_pipeline.sh`: per-scene failures increment a `FAIL` counter and `continue` to the next scene. Final summary prints `rendered=N failed=M skipped=K`.
+
+#### Quick-start examples
+
+```bash
+# 1. Render all 140 scenes, skip already-rendered ones (default)
+bash batch_render_path.sh
+
+# 2. Re-render every scene regardless of existing output
+SKIP_EXISTING="" bash batch_render_path.sh
+
+# 3. Fewer frames, native resolution, second GPU
+N_FRAMES=60 RESIZE=original DEVICE=cuda:1 bash batch_render_path.sh
+
+# 4. Plain GaussianPro models (no depth prior)
+USE_DEPTH_PRIOR="" bash batch_render_path.sh
+
+# 5. White background
+WHITE_BG=1 bash batch_render_path.sh
+
+# 6. Custom scenes root
+SCENES_DIR=/mnt/data/my_scenes bash batch_render_path.sh
+```
 
 ---
 
-## 9. Data Contracts
+## 10. Data Contracts
 
-### 9.1 Frame Extraction Output
+### 10.1 Frame Extraction Output
 
 ```
 data/images/{dataset}/
@@ -436,7 +738,7 @@ data/images/{dataset}/
                     # sorted by integer stem for temporal ordering
 ```
 
-### 9.2 VGGT Scene Output (`data/scenes/{dataset}/`)
+### 10.2 VGGT Scene Output (`data/scenes/{dataset}/`)
 
 ```
 data/scenes/{dataset}/
@@ -458,7 +760,7 @@ data/scenes/{dataset}/
 
 > **Camera convention:** VGGT uses OpenCV (Z-forward, Y-down). GaussianPro uses the same convention. No axis flip is required between stages.
 
-### 9.3 GaussianPro Training Input (auto-provisioned by `gaussianpro_train.py`)
+### 10.3 GaussianPro Training Input (auto-provisioned by `gaussianpro_train.py`)
 
 ```
 data/scenes/{dataset}/
@@ -475,7 +777,9 @@ data/scenes/{dataset}/
 └── metricdepth/              ← symlink → depth_maps/, created by gaussianpro_train.py
 ```
 
-### 9.4 GaussianPro Training Output
+### 10.4 GaussianPro Training Output
+
+Default (full save schedule, `GP_SAVE_ONLY_FINAL` unset):
 
 ```
 data/scenes/{dataset}/output_{iter}_gp[_depth_prior]/
@@ -490,7 +794,20 @@ data/scenes/{dataset}/output_{iter}_gp[_depth_prior]/
 └── events.out.tfevents.*
 ```
 
-### 9.5 GaussianPro Render Output
+Final-iteration-only (batch default, `GP_SAVE_ONLY_FINAL=1`):
+
+```
+data/scenes/{dataset}/output_{iter}_gp[_depth_prior]/
+├── input.ply
+├── point_cloud/
+│   └── iteration_{iter}/point_cloud.ply
+├── chkpnt_{iter}.pth
+├── cameras.json
+├── cfg_args
+└── events.out.tfevents.*
+```
+
+### 10.5 GaussianPro Render Output (Stage D)
 
 ```
 output_{iter}_gp[_depth_prior]/
@@ -508,9 +825,26 @@ output_{iter}_gp[_depth_prior]/
     └── render_normal/
 ```
 
+### 10.6 Ellipse-Orbit Render Output (Stage E)
+
+```
+output_{iter}_gp[_depth_prior]/
+└── render/
+    └── ours_{iter}/
+        ├── renders/
+        │   ├── 00000.png … 00{N-1}.png   orbit frame PNGs (default N=120)
+        │   └── (no gt/ or depth sub-dirs; novel views have no ground truth)
+        ├── interpolation_renders.mp4      N-frame orbit video @ fps (default 30)
+        ├── train_renders/
+        │   └── 00000.png … 000{M-1}.png  re-rendered training views
+        └── train_renders.mp4             M-frame training-view video @ fps
+```
+
+> **Key distinction from Stage D:** Stage D outputs live under `train/` and `test/`; Stage E outputs live under `render/`. Both can coexist in the same model directory.
+
 ---
 
-## 10. Environment and Dependencies
+## 11. Environment and Dependencies
 
 ### Conda Environment (`environment.yml`)
 
@@ -579,7 +913,7 @@ For air-gapped environments, pre-download to `checkpoints/vggt_1b.pt` and pass `
 
 ---
 
-## 11. Observed Run: `index_0003`
+## 12. Observed Run: `index_0003`
 
 A complete end-to-end run was performed on dataset `index_0003`:
 
@@ -606,7 +940,7 @@ An intermediate run at 1,100 iterations (`output_1100_gp_depth_prior/`) is also 
 
 ---
 
-## 12. Deviations from PRD
+## 13. Deviations from PRD
 
 | # | PRD Specification | Actual Implementation |
 |---|---|---|
@@ -628,10 +962,14 @@ An intermediate run at 1,100 iterations (`output_1100_gp_depth_prior/`) is also 
 | 16 | `output_{iter}_gp/tb_logs/` | TensorBoard log: `events.out.tfevents.*` at root of model dir |
 | 17 | No `input.ply` mentioned | GaussianPro writes `input.ply` at model path root |
 | 18 | Render outputs depth/normal | Actual render also produces `render_depth/` and `render_normal/` directories |
+| 19 | No batch runner specified | `batch_pipeline.sh` added; iterates `DATAROOT/{photorealistic,stylized}/index_*/video.mp4`; dataset names encode style and index (e.g. `photorealistic_index_0003`) |
+| 20 | GaussianPro always saves default checkpoint schedule | `gaussianpro_train.py` now accepts `--save_iterations` and `--checkpoint_iterations` overrides; `batch_pipeline.sh` defaults to `GP_SAVE_ONLY_FINAL=1` which restricts saves and checkpoints to the final iteration only |
+| 21 | No orbit/trajectory render specified | `gaussianpro_render_path.py` (Stage E) added; generates a 120-frame ellipse-orbit video from training-camera poses using the same algorithm as InstantSplat's `render_path()` in `3dgs.py` |
+| 22 | No batch orbit render specified | `batch_render_path.sh` added; runs Stage E across all 140 scenes in `data/scenes/`, with skip-existing logic and per-scene error isolation |
 
 ---
 
-## 13. Known Issues and Quirks
+## 14. Known Issues and Quirks
 
 ### pycolmap 4.x Compatibility
 
@@ -664,9 +1002,32 @@ normal_hw3 = (np.load("0.npy").transpose(1, 2, 0) - 0.5) * 2.0
 - Metrics computed from `test/` renders reflect novel-view quality on frames the Gaussians never directly supervised, but the comparison is not strictly fair (Gaussians were fit to those frames).
 - For rigorous evaluation, use `--eval` for **both** training and rendering.
 
+### Stage E `utils` Module Conflict (resolved)
+
+**Symptom:** `ModuleNotFoundError: No module named 'utils.system_utils'` whenever GaussianPro modules are imported in any Python process that has `vggt_gaussianpro/` on `sys.path`.
+
+**Root cause:** Two incompatible `utils/` packages co-exist in the project:
+
+| Package | Path | Has `__init__.py`? | Type |
+|---|---|---|---|
+| Pipeline utils | `vggt_gaussianpro/utils/` | **Yes** | Regular package |
+| GaussianPro utils | `third_party/GaussianPro/utils/` | **No** | Namespace package |
+
+Python's import system always prefers a **regular package** over a **namespace package** regardless of `sys.path` ordering. So `vggt_gaussianpro/utils/` is selected unconditionally whenever `vggt_gaussianpro/` appears anywhere on `sys.path` — including when Python automatically inserts the running script's directory as `sys.path[0]`.
+
+**Resolution (two-part):**
+
+1. **Subprocess isolation** — Stage E uses the same subprocess pattern as all other stage wrappers. `gaussianpro_render_path.py` contains no GaussianPro imports at all; rendering is delegated to `_gaussianpro_render_path_worker.py`, invoked with `cwd=GP_ROOT` and `PYTHONPATH=GP_ROOT` prepended.
+
+2. **`sys.path` scrub in worker** — Even as a subprocess, Python inserts the worker script's directory (`vggt_gaussianpro/`) as `sys.path[0]`. The worker therefore strips `vggt_gaussianpro/` from `sys.path` before any import:
+   ```python
+   sys.path = [p for p in sys.path if os.path.abspath(p) != _WORKER_DIR]
+   ```
+   With `vggt_gaussianpro/` removed, the regular `utils/__init__.py` is no longer visible and GaussianPro's namespace `utils/` resolves correctly from `_GP_ROOT`.
+
 ### Batch Mode Frame Cap
 
-`batch_pipeline.sh` does not set `MAX_FRAMES`, so scenes with many frames (> 48) may trigger OOM on 24–48 GB GPUs. Set `MAX_FRAMES=48` in the environment before running batch mode on large frame-count videos.
+`batch_pipeline.sh` defaults `MAX_FRAMES=48`, matching `pipeline.sh`. This prevents OOM on 24–48 GB GPUs for scenes with many frames. To lift the cap and process all extracted frames, set `MAX_FRAMES=` (empty) in the environment — but expect ~21 GB VRAM usage at 100 frames.
 
 ---
 

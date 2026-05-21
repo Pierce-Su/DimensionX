@@ -83,6 +83,7 @@ venv.bak/
 /sat_weights/
 /instantsplat/data/
 /vggt_gaussianpro/data/
+/vggt_gaussianpro/data_single/
 
 
 # --- IDE / Editor ---

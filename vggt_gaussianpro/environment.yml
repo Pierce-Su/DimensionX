@@ -25,7 +25,7 @@ dependencies:
       - einops
       - safetensors
       # COLMAP binary I/O (required by vggt.dependency.np_to_pycolmap)
-      - pycolmap
+      - pycolmap==3.8.0
       # 3D / visualisation
       - trimesh
       - plyfile

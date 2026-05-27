@@ -13,9 +13,12 @@ dependencies:
   - conda-forge::scipy
   - pip:
       # Force CUDA 12.8 torch wheels; all other packages fall back to PyPI
+      # torch>=2.9 has no cu128 wheel — pip falls back to PyPI and pulls a
+      # CUDA 13.0 build, which mismatches the system CUDA 12.8 toolkit.
+      # Constraining to >=2.7,<2.9 keeps pip on the cu128 index.
       - --index-url https://download.pytorch.org/whl/cu128
       - --extra-index-url https://pypi.org/simple
-      - torch>=2.9
+      - torch>=2.7,<2.9
       - torchvision
       # VGGT core deps
       - huggingface_hub

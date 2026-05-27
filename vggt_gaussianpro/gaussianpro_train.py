@@ -171,7 +171,7 @@ def _validate_sparse(scene_dir: Path) -> None:
     if images_bin.stat().st_size <= 8:
         sys.exit(
             f"[gaussianpro_train] ERROR: {images_bin} exists but contains 0 images "
-            "(file is only {images_bin.stat().st_size} bytes).\n\n"
+            f"(file is only {images_bin.stat().st_size} bytes).\n\n"
             "This is caused by a pycolmap 4.x compatibility bug that has now been "
             "patched in vggt/dependency/np_to_pycolmap.py.  Please re-run "
             "vggt_inference.py for this dataset to regenerate the COLMAP files:\n\n"

@@ -20,7 +20,7 @@ set -euo pipefail
 # --------------------------------------------------------------------------- #
 # Configurable variables (override via environment)
 # --------------------------------------------------------------------------- #
-VIDEO_PATH="${VIDEO_PATH:-./data/video/video.mp4}"
+VIDEO_PATH="${VIDEO_PATH:-}"
 DATASET="${DATASET:-}"          # auto-derived from video path when empty
 NUM_FRAMES="${NUM_FRAMES:-}"    # leave empty to extract ALL frames (default)
 DEVICE="${DEVICE:-cuda:0}"
@@ -40,6 +40,9 @@ CONF_THRES="${CONF_THRES:-}"
 GP_ITER="${GP_ITER:-30000}"         # total GaussianPro training iterations
 GP_LAMBDA_LPIPS="${GP_LAMBDA_LPIPS:-0.3}"
 USE_DEPTH_PRIOR="${USE_DEPTH_PRIOR:-1}"  # set to "" to disable VGGT depth prior injection
+# Save only the final iteration's point cloud and checkpoint (default: yes).
+# Set to "" to restore the full default schedule {1, 7000, 20000, 30000}.
+GP_SAVE_ONLY_FINAL="${GP_SAVE_ONLY_FINAL:-1}"
 SKIP_RENDER="${SKIP_RENDER:-}"      # set to "1" to skip Stage D rendering
 SKIP_EVAL="${SKIP_EVAL:-}"            # set to "1" to omit --eval (default: pass --eval)
 
@@ -64,6 +67,7 @@ echo "  device       : ${DEVICE}"
 echo "  BA           : ${USE_BA:-disabled}"
 echo "  GP iter      : ${GP_ITER}"
 echo "  depth prior  : ${USE_DEPTH_PRIOR:-disabled}"
+echo "  save only final : ${GP_SAVE_ONLY_FINAL:-no (full schedule)}"
 echo "  render       : ${SKIP_RENDER:+skipped}"
 if [[ -z "${SKIP_EVAL}" ]]; then
     echo "  eval render  : yes (--eval)"
@@ -110,12 +114,24 @@ echo "[Stage B] Done. Scene in: ${SCRIPT_DIR}/data/scenes/${DATASET}/"
 echo ""
 echo "[Stage C] Running GaussianPro …"
 
+# Build save/checkpoint args: restrict to GP_ITER only when
+# GP_SAVE_ONLY_FINAL is set, otherwise let gaussianpro_train.py use
+# its default schedule {1, 7000, 20000, GP_ITER}.
+SAVE_ITER_ARGS=()
+if [[ -n "${GP_SAVE_ONLY_FINAL}" ]]; then
+    SAVE_ITER_ARGS+=(
+        --save_iterations        "${GP_ITER}"
+        --checkpoint_iterations  "${GP_ITER}"
+    )
+fi
+
 python "${SCRIPT_DIR}/gaussianpro_train.py" \
     --dataset       "${DATASET}"       \
     --iter          "${GP_ITER}"       \
     --lambda_lpips  "${GP_LAMBDA_LPIPS}" \
     ${USE_DEPTH_PRIOR:+--use_depth_prior} \
-    --device        "${DEVICE}"
+    --device        "${DEVICE}"        \
+    "${SAVE_ITER_ARGS[@]}"
 
 echo "[Stage C] Done."
 

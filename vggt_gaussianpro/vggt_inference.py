@@ -322,9 +322,14 @@ def save_depth_confidence_normals(
     depth_map: np.ndarray,
     depth_conf: np.ndarray,
     points_3d: np.ndarray,
+    image_names: list,
 ):
     """
     Persist per-frame depth maps, confidence maps, and surface normals.
+
+    Files are named after the source image stem (e.g. "144.png" → "144.npy") so
+    that GaussianPro's dataset_readers can locate them by replacing the "images"
+    directory with "normals" / "metricdepth" in the image path.
 
     Shapes:
         depth_map:  (N, H, W)
@@ -341,13 +346,14 @@ def save_depth_confidence_normals(
 
     N = depth_map.shape[0]
     for i in range(N):
-        np.save(str(depth_dir / f"{i}.npy"), depth_map[i].astype(np.float32))
-        np.save(str(conf_dir  / f"{i}.npy"), depth_conf[i].astype(np.float32))
+        stem = Path(image_names[i]).stem
+        np.save(str(depth_dir / f"{stem}.npy"), depth_map[i].astype(np.float32))
+        np.save(str(conf_dir  / f"{stem}.npy"), depth_conf[i].astype(np.float32))
         # Store normals as (3, H, W) in [0, 1] range.
         # GaussianPro's loadCam applies .transpose((1,2,0)) expecting channels-first (3,H,W)
         # input, then applies (n - 0.5) * 2 to recover [-1, 1] unit vectors.
         normal_01 = ((normals[i] + 1.0) / 2.0).astype(np.float32)       # (H, W, 3)
-        np.save(str(norm_dir  / f"{i}.npy"), np.transpose(normal_01, (2, 0, 1)))  # (3, H, W)
+        np.save(str(norm_dir  / f"{stem}.npy"), np.transpose(normal_01, (2, 0, 1)))  # (3, H, W)
 
     print(f"Saved depth maps, confidence maps, normals for {N} frames.")
 
@@ -570,7 +576,7 @@ def main():
     print(f"COLMAP reconstruction written to: {sparse_dir}")
 
     # --------------------------------- save depth, confidence, normal maps
-    save_depth_confidence_normals(scene_dir, depth_map, depth_conf, points_3d)
+    save_depth_confidence_normals(scene_dir, depth_map, depth_conf, points_3d, base_names)
 
     if args.save_glb:
         pts_vis = pts_filtered if not args.use_ba else points_3d_ba

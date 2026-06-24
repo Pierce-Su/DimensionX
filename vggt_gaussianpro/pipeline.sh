@@ -8,11 +8,13 @@
 #   VIDEO_PATH=... DATASET=myrun bash pipeline.sh
 #
 # Stages:
-#   A) get_frame.py          — extract all frames from CogVideoX MP4
-#   B) vggt_inference.py     — VGGT camera estimation + point cloud (COLMAP binary)
-#   C) gaussianpro_train.py  — GaussianPro optimization with progressive propagation
-#   D) gaussianpro_render.py — render trained views (optional, set SKIP_RENDER=1 to skip;
+#   A) get_frame.py               — extract all frames from CogVideoX MP4
+#   B) vggt_inference.py          — VGGT camera estimation + point cloud (COLMAP binary)
+#   C) gaussianpro_train.py       — GaussianPro optimization with progressive propagation
+#   D) gaussianpro_render.py      — render trained views (optional, set SKIP_RENDER=1 to skip;
 #      set SKIP_EVAL=1 to omit --eval / train-style renders only)
+#   E) gaussianpro_render_path.py — novel-view sinusoidal-elevation orbit video
+#      (set SKIP_RENDER_PATH=1 to skip)
 # =============================================================================
 
 set -euo pipefail
@@ -28,13 +30,18 @@ USE_BA="${USE_BA:-}"            # set to "--use_ba" to enable bundle adjustment
 SAVE_GLB="${SAVE_GLB:-}"        # set to "--save_glb" to write scene.glb
 # Maximum frames fed to VGGT (prevents OOM on large frame counts).
 # Frames are uniformly subsampled when the extracted count exceeds this value.
-# Recommended: 48 for 48 GB VRAM | 32 for 24 GB VRAM | unset = no limit.
-MAX_FRAMES="${MAX_FRAMES:-48}"
+# Flash-Attention-2 (SDPA) makes total VRAM scale approximately linearly with N.
+# Empirically measured on RTX 6000 Ada (47.4 GB usable):
+#   N= 80 → 32 GB | N=100 → 41 GB | N=120 → 47 GB (tight) | N=145 → OOM
+# Note: the paper reports 200 frames ≈ 40 GB, measured on H100 with FlashAttention-3;
+# Ada/FA2 has a larger per-frame activation footprint (~0.4 GB/frame overhead).
+# Safe defaults: 110 for 48 GB VRAM | 60 for 24 GB VRAM | unset = no limit.
+MAX_FRAMES="${MAX_FRAMES:-110}"
 # Absolute confidence threshold for depth filtering (no-BA path).
-# Leave unset to use the default (5.0, matches VGGT demo_colmap.py).
-# For aerial / satellite / OOD footage the automatic percentile fallback
-# will activate regardless, so you usually don't need to set this manually.
-CONF_THRES="${CONF_THRES:-}"
+# 3.0 keeps more points from partially-OOD orbit content while still filtering
+# clear outliers. The automatic percentile fallback (keeping top 35% of pixels)
+# activates when fewer than 1000 pixels pass this threshold.
+CONF_THRES="${CONF_THRES:-3.0}"
 
 # --- GaussianPro (Stage C/D) ---
 GP_ITER="${GP_ITER:-30000}"         # total GaussianPro training iterations
@@ -43,10 +50,19 @@ USE_DEPTH_PRIOR="${USE_DEPTH_PRIOR:-1}"  # set to "" to disable VGGT depth prior
 # Save only the final iteration's point cloud and checkpoint (default: yes).
 # Set to "" to restore the full default schedule {1, 7000, 20000, 30000}.
 GP_SAVE_ONLY_FINAL="${GP_SAVE_ONLY_FINAL:-1}"
-SKIP_RENDER="${SKIP_RENDER:-}"      # set to "1" to skip Stage D rendering
+SKIP_RENDER="${SKIP_RENDER:-}"        # set to "1" to skip Stage D rendering
 SKIP_EVAL="${SKIP_EVAL:-}"            # set to "1" to omit --eval (default: pass --eval)
 
+# --- Novel-view orbit render (Stage E) ---
+SKIP_RENDER_PATH="${SKIP_RENDER_PATH:-}"   # set to "1" to skip Stage E
+N_FRAMES="${N_FRAMES:-120}"               # number of frames in the orbit video
+Z_AMPLITUDE_FRAC="${Z_AMPLITUDE_FRAC:-0.35}"  # elevation amplitude (fraction of orbit radius)
+RESIZE="${RESIZE:-crop}"                  # crop | pad | original
+FPS="${FPS:-30}"
+
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# Reduce VRAM fragmentation; helps when many frame-count configurations are tested.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # --------------------------------------------------------------------------- #
 # Derive a dataset name from the video path when not explicitly provided
@@ -74,6 +90,9 @@ if [[ -z "${SKIP_EVAL}" ]]; then
 else
     echo "  eval render  : no (--eval omitted)"
 fi
+echo "  render path  : ${SKIP_RENDER_PATH:+skipped}"
+echo "  n_frames     : ${N_FRAMES}"
+echo "  z_amp_frac   : ${Z_AMPLITUDE_FRAC}"
 echo "============================================================"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -135,16 +154,17 @@ python "${SCRIPT_DIR}/gaussianpro_train.py" \
 
 echo "[Stage C] Done."
 
+# Derive model path once — shared by Stage D and Stage E.
+SUFFIX=""
+[[ -n "${USE_DEPTH_PRIOR}" ]] && SUFFIX="_depth_prior"
+MODEL_PATH="${SCRIPT_DIR}/data/scenes/${DATASET}/output_${GP_ITER}_gp${SUFFIX}"
+
 # --------------------------------------------------------------------------- #
-# Stage D — render (optional)
+# Stage D — render trained views (optional)
 # --------------------------------------------------------------------------- #
 if [[ -z "${SKIP_RENDER}" ]]; then
     echo ""
     echo "[Stage D] Rendering …"
-
-    SUFFIX=""
-    [[ -n "${USE_DEPTH_PRIOR}" ]] && SUFFIX="_depth_prior"
-    MODEL_PATH="${SCRIPT_DIR}/data/scenes/${DATASET}/output_${GP_ITER}_gp${SUFFIX}"
 
     RENDER_EVAL_ARGS=()
     [[ -z "${SKIP_EVAL}" ]] && RENDER_EVAL_ARGS+=(--eval)
@@ -156,6 +176,25 @@ if [[ -z "${SKIP_RENDER}" ]]; then
         "${RENDER_EVAL_ARGS[@]}"
 
     echo "[Stage D] Done. Renders in: ${MODEL_PATH}/train/"
+fi
+
+# --------------------------------------------------------------------------- #
+# Stage E — novel-view sinusoidal-elevation orbit render
+# --------------------------------------------------------------------------- #
+if [[ -z "${SKIP_RENDER_PATH}" ]]; then
+    echo ""
+    echo "[Stage E] Rendering novel-view orbit …"
+
+    python "${SCRIPT_DIR}/gaussianpro_render_path.py" \
+        --model_path         "${MODEL_PATH}"                        \
+        --source_path        "${SCRIPT_DIR}/data/scenes/${DATASET}" \
+        --n_frames           "${N_FRAMES}"                          \
+        --z_amplitude_frac   "${Z_AMPLITUDE_FRAC}"                  \
+        --resize             "${RESIZE}"                            \
+        --fps                "${FPS}"                               \
+        --device             "${DEVICE}"
+
+    echo "[Stage E] Done. Orbit video in: ${MODEL_PATH}/render/"
 fi
 
 echo ""

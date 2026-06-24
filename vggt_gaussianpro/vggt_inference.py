@@ -63,9 +63,9 @@ from utils.depth_to_normal import batch_point_map_to_normals
 VGGT_FIXED_RESOLUTION = 518   # resolution VGGT runs at internally
 IMG_LOAD_RESOLUTION   = 1024  # resolution images are loaded at before feeding to VGGT
 CONF_THRES_VALUE      = 5.0   # depth confidence threshold (no-BA path) — default matches VGGT demo
-CONF_THRES_FALLBACK_PERCENTILE = 80  # percentile fallback when absolute threshold yields < MIN_POINTS
+CONF_THRES_FALLBACK_PERCENTILE = 65  # percentile fallback: keeps the top 35% of pixels by confidence
 MIN_POINTS_BEFORE_FALLBACK     = 1_000
-MAX_POINTS_FOR_COLMAP = 100_000
+MAX_POINTS_FOR_COLMAP = 300_000
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +173,9 @@ def parse_args():
         help="Maximum number of frames fed to VGGT. "
              "When the extracted frame count exceeds this value the frames are "
              "uniformly subsampled before the VGGT forward pass. "
-             "Recommended: ≤48 for 48 GB VRAM, ≤32 for 24 GB VRAM. "
+             "Empirically on RTX 6000 Ada (47.4 GB usable PyTorch VRAM): "
+             "N=80→32 GB, N=100→41 GB, N=120→47 GB (tight), N=145→OOM. "
+             "Recommended: ≤110 for 48 GB VRAM, ≤60 for 24 GB VRAM. "
              "Default: no limit (use all frames).",
     )
     # --- misc ---
@@ -441,11 +443,33 @@ def main():
     # ---------------------------------------------------------- load model
     model = load_model(args.checkpoint, device)
 
+    print(f"[VGGT] Flash SDPA:   {torch.backends.cuda.flash_sdp_enabled()}")
+    print(f"[VGGT] MemEff SDPA:  {torch.backends.cuda.mem_efficient_sdp_enabled()}")
+    print(f"[VGGT] Math SDPA:    {torch.backends.cuda.math_sdp_enabled()}")
+
     # ---------------------------------------------------------- VGGT forward pass
+    # For the no-BA path, downscale images to VGGT's native resolution once and
+    # pre-extract RGB colours on CPU so the 1024px float32 GPU tensor (~9 MB × N)
+    # can be freed before the memory-intensive aggregator forward pass.
+    # The BA path retains the 1024px tensor because predict_tracks() needs it.
+    if not args.use_ba:
+        vggt_input = F.interpolate(
+            images, size=(VGGT_FIXED_RESOLUTION, VGGT_FIXED_RESOLUTION),
+            mode="bilinear", align_corners=False,
+        )
+        points_rgb_full_pre = (vggt_input.cpu().numpy() * 255).astype(np.uint8).transpose(0, 2, 3, 1)
+        del images
+        torch.cuda.empty_cache()
+    else:
+        points_rgb_full_pre = None
+        vggt_input = images
+
     print("Running VGGT …")
     extrinsic, intrinsic, depth_map, depth_conf = run_vggt(
-        model, images, dtype, VGGT_FIXED_RESOLUTION
+        model, vggt_input, dtype, VGGT_FIXED_RESOLUTION
     )
+    del vggt_input
+    torch.cuda.empty_cache()
 
     # 3-D point map from depth + cameras (more accurate than point_head branch)
     points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
@@ -503,12 +527,9 @@ def main():
         image_size = np.array([VGGT_FIXED_RESOLUTION, VGGT_FIXED_RESOLUTION])
         N, H, W, _ = points_3d.shape
 
-        points_rgb_full = F.interpolate(
-            images, size=(VGGT_FIXED_RESOLUTION, VGGT_FIXED_RESOLUTION),
-            mode="bilinear", align_corners=False,
-        )
-        points_rgb_full = (points_rgb_full.cpu().numpy() * 255).astype(np.uint8)
-        points_rgb_full = points_rgb_full.transpose(0, 2, 3, 1)  # (N, H, W, 3)
+        # RGB colours were pre-extracted at 518px before run_vggt() to allow the
+        # 1024px GPU tensor to be freed ahead of the aggregator forward pass.
+        points_rgb_full = points_rgb_full_pre  # (N, H, W, 3) uint8
 
         # (N, H, W, 3) — pixel coordinates + frame index per valid point
         points_xyf = create_pixel_coordinate_grid(N, H, W)

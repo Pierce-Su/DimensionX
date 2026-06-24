@@ -145,18 +145,41 @@ def _invert_transform_poses_pca(poses_recentered, transform, scale_factor):
     return _unpad_poses(np.linalg.inv(transform) @ _pad_poses(poses_recentered))
 
 
-def _generate_ellipse_path(poses: np.ndarray, n_frames: int = 120) -> np.ndarray:
-    """Return ``(n_frames, 3, 4)`` C2W matrices on a constant-speed ellipse orbit."""
+def _generate_ellipse_path(poses: np.ndarray, n_frames: int = 120,
+                            z_amplitude_frac: float = 0.35) -> np.ndarray:
+    """Return ``(n_frames, 3, 4)`` C2W matrices on a sinusoidal-elevation orbit.
+
+    For object-centric orbit training data (e.g. CogVideoX), the training cameras
+    already span the full horizontal orbit, so a flat XY ellipse would reproduce
+    the same trajectory rather than producing novel views.  Adding a sinusoidal Z
+    component makes the camera rise above and dip below the training orbit plane,
+    visiting elevations that the training frames never covered.
+
+    Args:
+        poses: (N, 3, 4) C2W matrices in NeRF convention (after Y/Z flip).
+        n_frames: Number of frames in the output orbit.
+        z_amplitude_frac: Elevation amplitude as a fraction of the mean XY orbit
+            radius.  0.35 means the camera rises/dips ±35% of the orbit radius.
+            Set to 0.0 to recover the original flat-ellipse behaviour.
+    """
     center = _focus_point_fn(poses)
-    offset = np.array([center[0], center[1], 0.0])
+    # Use the full 3-D focus point so the bounding box is correctly centred on
+    # the scene regardless of any residual Z offset after PCA alignment.
+    offset = center.copy()
     sc     = np.percentile(np.abs(poses[:, :3, 3] - offset), 100, axis=0)
     low, high = -sc + offset, sc + offset
+
+    # Elevation amplitude: a fraction of the mean horizontal radius so it scales
+    # naturally with scene size.  A minimum guard keeps it non-zero even for
+    # scenes where sc[0]/sc[1] are tiny (degenerate point-cloud cases).
+    mean_xy_radius = 0.5 * (sc[0] + sc[1])
+    z_amplitude    = z_amplitude_frac * max(mean_xy_radius, 1e-3)
 
     def get_positions(theta):
         return np.stack([
             low[0] + (high - low)[0] * (np.cos(theta) * 0.5 + 0.5),
             low[1] + (high - low)[1] * (np.sin(theta) * 0.5 + 0.5),
-            np.zeros_like(theta),
+            offset[2] + z_amplitude * np.sin(theta),
         ], -1)
 
     theta     = np.linspace(0, 2.0 * np.pi, n_frames + 1, endpoint=True)
@@ -228,7 +251,8 @@ def _cam_dict_to_serialisable(uid: int, image_name: str, c2w_rotation, c2w_posit
     }
 
 
-def _build_camera_payload(train_cams: List[dict], n_frames: int) -> dict:
+def _build_camera_payload(train_cams: List[dict], n_frames: int,
+                           z_amplitude_frac: float = 0.35) -> dict:
     """
     Given the list of train camera dicts from cameras.json, compute the ellipse
     orbit and return a dict with keys "train_cams" and "orbit_cams", each a
@@ -246,7 +270,8 @@ def _build_camera_payload(train_cams: List[dict], n_frames: int) -> dict:
     # Flip y/z to NeRF convention for the ellipse algorithm, then flip back.
     poses[:, :, 1:3] *= -1
     poses, transform, scale_factor = _transform_poses_pca(poses)
-    render_poses_pca = _generate_ellipse_path(poses, n_frames)
+    render_poses_pca = _generate_ellipse_path(poses, n_frames,
+                                              z_amplitude_frac=z_amplitude_frac)
     render_poses = _invert_transform_poses_pca(render_poses_pca, transform, scale_factor)
     render_poses[:, :, 1:3] *= -1
 
@@ -315,6 +340,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fps",  type=int, default=30)
     parser.add_argument(
+        "--z_amplitude_frac", type=float, default=0.35,
+        help=(
+            "Elevation amplitude of the novel-view orbit as a fraction of the "
+            "mean horizontal orbit radius.  0.35 (default) makes the camera "
+            "rise/dip ±35%% of the orbit radius above/below the training plane, "
+            "producing views at elevations not covered by the training orbit. "
+            "Set to 0.0 to recover the original flat-ellipse behaviour."
+        ),
+    )
+    parser.add_argument(
         "--white_background", action="store_true", default=False,
     )
     parser.add_argument("--device", type=str, default="cuda:0")
@@ -367,6 +402,7 @@ def main() -> None:
     print(f"  source_path      : {source_path}")
     print(f"  iteration        : {iteration}")
     print(f"  n_frames         : {args.n_frames}")
+    print(f"  z_amplitude_frac : {args.z_amplitude_frac}")
     print(f"  resize           : {args.resize}")
     print(f"  fps              : {args.fps}")
     print(f"  white_background : {args.white_background}")
@@ -375,7 +411,8 @@ def main() -> None:
     # --- Generate camera payload -------------------------------------------
     print("\n[render_path] Building ellipse orbit from cameras.json …")
     train_cams = _load_train_cameras_from_json(str(cameras_json))
-    payload    = _build_camera_payload(train_cams, n_frames=args.n_frames)
+    payload    = _build_camera_payload(train_cams, n_frames=args.n_frames,
+                                       z_amplitude_frac=args.z_amplitude_frac)
     print(f"  train cameras : {len(payload['train_cams'])}")
     print(f"  orbit cameras : {len(payload['orbit_cams'])}")
 

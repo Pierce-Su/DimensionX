@@ -315,8 +315,13 @@ def main() -> None:
         cmd += ["--checkpoint_iterations", *[str(it) for it in chkpt_iters]]
 
     if args.use_depth_prior:
+        # --load_normal: VGGT normals for planar-constrained loss.
+        # --depth_loss:  enables progressive depth propagation (uses *rendered*
+        #                depth as seed — NOT the pre-loaded metricdepth maps).
+        # Do NOT pass --load_depth here: it pre-fills Camera.depth on CPU and
+        # makes train.py skip src-view propagation, causing a CPU/CUDA mismatch
+        # in check_geometric_consistency at iteration ~1000.
         cmd += [
-            "--load_depth",
             "--load_normal",
             "--depth_loss",
             "--normal_loss",
